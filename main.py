@@ -1,1138 +1,1254 @@
 #----------------------Betting credentials-------------------------------#
-KALSHI_API_KEY_ID  = "YOUR_KALSHI_API_KEY"
-KALSHI_PRIVATE_KEY = b"""YOUR_KALSHI_SECRET_KEY"""
+KALSHI_API_KEY_ID  = "YOUR_API_KEY"
+KALSHI_PRIVATE_KEY = b"""YOUR_SECRET_KEY"""
 #----------------------Betting credentials-------------------------------#
-##########################################################################
-#!/usr/bin/env python3
-"""
-BTC 15-Min Kalshi Auto-Predictor
-Runs 24/7, fires 9 predictions per 15-min market boundary.
-Strategy filters applied automatically — only logs BET when all rules pass.
-
-Rules:
-  1. Time window   — 9:45am–6:45pm EST, every day including weekends
-  2. Vol floor     — R.Vol >= 15% at prefetch time
-  3. Vol ceiling   — Volume <= 500% of 721m avg (extreme spikes skipped)
-  4. Vol accel     — skip if 15-min vol > 1.5x 60-min vol at prefetch time
-                     (regime shift actively in progress — model calibration stale)
-  5. Agreement     — F7, F8, F9 must all predict the same direction
-  6. Confidence    — F7 >= 75% AND F8 >= 75% AND F9 >= 75%
-  7. Autocorr      — autocorr >= -0.25 (skip deep mean-reverting regimes)
-  8. Expected value— EV = model_prob - contract_ask, logged for reference only.
-                     No longer a filter — fixed payouts mean edge size is irrelevant.
-  9. Prior move    — if prev market moved > PRIOR_SIGMA_THRESHOLD σ, require F9 >= 88%
-                     if prev market moved > PRIOR_SIGMA_HARD_BLOCK σ, skip unconditionally
- 10. Deceleration  — compare velocity ($/min) F1→F5 (early) vs F5→F9 (late);
-                     skip if late velocity < 40% of early velocity in bet direction
-                     (momentum fading before the bet is placed)
- 11. Reversal guard— if spot reverses > 0.40σ between F8 and F9, skip
-                     (momentum already shifting before bet is placed)
- 12. Kalshi drift  — track YES ask at F7, F8, F9; skip if total drift > 5¢ against
-                     direction OR if both F7→F8 and F8→F9 windows move against us
-                     (acceleration). Detects crowd pricing in reversal in real time.
-
-Fire schedule (seconds after boundary):
-  F1:40   F2:60   F3:120  F4:180  F5:240  F6:270  ← observation only
-  F7:360  F8:480  F9:600                           ← decision fires (5 min remaining)
-
-Simulation model (augmented):
-  - GARCH(1,1)       time-varying volatility fitted from 1-min candles
-  - Student-t        fat-tailed innovations (df fitted from return data)
-  - Jump-diffusion   Merton model: Poisson arrivals, log-normal jump sizes
-
-Anti-lag design:
-  - Vol + BRTI pre-fetched in parallel 30s BEFORE each market boundary
-  - Only the Kalshi strike is fetched AFTER open (it changes each market)
-  - Result fetching runs in a background thread — never blocks predictions
-  - Total lag at prediction time: ~200ms (just the strike fetch)
-"""
-
+import datetime
+import time
+import base64
+import uuid
 import sys
 import math
-import time as _time
-import time
 import threading
-import datetime
-import dataclasses
-import concurrent.futures
-import uuid
-import base64
 import requests
-import numpy as np
-from scipy import stats, optimize
-from colorama import Fore, Style, init
-from cryptography.hazmat.primitives import hashes, serialization
+import brti_btc
+from collections import deque
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from brti import calculate_brti_fast
 
-init(autoreset=True)
+# ── Config ────────────────────────────────────────────────────────────────────
+
+BASE_URL           = "https://api.elections.kalshi.com"
+LOG_FILE           = "btc_live.txt"
+
+BUY_MIN_CENTS      = 98
+BUY_MAX_CENTS      = 100
+BET_DOLLARS        = 25
+MAX_OPPOSING_CENTS = 6
+
+WATCH_SECS_WEEKDAY = 900   # start observing 9 minutes before settlement
+WATCH_SECS_WEEKEND = 900   # start observing 9 minutes before settlement
+ENTRY_START_SECS   = 300   # earliest entry allowed: T-5:00
+MARKET_MIN_SECS    = 0
+POLL_MS            = 0.1
+
+# ── Startup fresh-market gate ─────────────────────────────────────────────────
+# On startup, ignore the currently open 15-minute market and wait until Kalshi
+# rotates to a new BTC 15-minute market. A fresh market usually has close to
+# 900 seconds left; this minimum avoids entering a market that changed while the
+# script was offline or delayed.
+STARTUP_FRESH_MIN_SECS = 850
+STARTUP_POLL_SECS      = 5
+
+# ── Climb filter ──────────────────────────────────────────────────────────────
+CLIMB_LOOKBACK_SECS = 80
+CLIMB_MAX_CENTS     = 10
+CLIMB_BYPASS_SECS   = 120
+
+# ── Buffer filter ─────────────────────────────────────────────────────────────
+BTC_MIN_BUFFER             = 50.00
+BTC_RESET_BUFFER           = 45.00  # sustained tracker resets only if buffer drops below this (prevents jitter resets)
+BTC_MIN_PROJECTED_BUFFER   = 95.00
+BUFFER_SKIP_PROJECTED_SECS = 90
+BUFFER_MIN_SUSTAINED_SECS  = 30   # buffer must be continuously ≥$50 for this long before trigger (mid-window only)
+
+# ── Marginal certainty filter ─────────────────────────────────────────────────
+# Blocks early 99¢ triggers that do not have enough BTC clearance. This targets
+# near-certain market pricing with only marginal distance from the strike.
+MARGINAL_CERTAINTY_MIN_CENTS = 99
+MARGINAL_CERTAINTY_MIN_SECS  = 120
+MARGINAL_CERTAINTY_BUFFER    = 85.00
+
+# ── ROC filter ────────────────────────────────────────────────────────────────
+BTC_MAX_ROC_MOVE      = 300.0
+BTC_ROC_LOOKBACK_MINS = 5
+
+# ── Recent volatility / explosive-move filter ─────────────────────────────────
+# Scans the broader recent lookback for ANY rolling 3-minute window where BTC's
+# high-low range exceeded the threshold. This catches short explosive bursts
+# without incorrectly treating the entire lookback as one "3m" window.
+# Scan the current market watch window from watch_started_at through the trigger time.
+# Inside that elapsed period, find the largest move in any rolling 3-minute slice.
+RECENT_RANGE_WINDOW_SECS   = 180   # each tested window is 3 minutes
+RECENT_RANGE_MIN_MOVE      = 100.0 # only care once any 3m window moved this much
+RECENT_RANGE_BUFFER_MULT   = 1.0   # require buffer >= 1.00 × max rolling 3m range
+
+# ── Mid-window bounce filter ──────────────────────────────────────────────────
+BOUNCE_MIN_EXCURSION   = 40.00
+BOUNCE_MIN_T_REMAINING = 100
+
+# ── Contested-strike filter ───────────────────────────────────────────────────
+# Skip a market once BTC has made two meaningful crossings through the strike.
+# A crossing only counts after BTC reaches at least this many dollars beyond
+# the strike on the opposite side, so tiny $1–$6 wiggles around the strike are
+# ignored. Example: +$20 → -$8 → +$9 counts as two meaningful crossings.
+CONTESTED_CROSS_EXCURSION = 7.00
+CONTESTED_CROSS_MAX_COUNT = 2
+
+# ── Shallow book filter ───────────────────────────────────────────────────────
+SHALLOW_BOOK_MAX_CONTRACTS = 25_000
+SHALLOW_BOOK_MIN_RATIO     = 16
+
+# ── Post-climb-skip veto filter ───────────────────────────────────────────────
+# After a NO climb-skip, record the BTC spot price at that moment. In the next
+# market, the "retracement risk" is how far BTC has fallen since the skip fired.
+# If that risk is small (move stalled), allow the trade. If large, require the
+# current gap below the new strike to exceed SAFETY_RATIO * retracement_risk.
+# Stall threshold scaled from ETH $2.00 × 64 = $128.
+POST_CLIMB_STALL_THRESHOLD = 128.00  # retracement risk <= this → move stalled → allow
+POST_CLIMB_SAFETY_RATIO    = 0.50    # gap must be > this fraction of retracement risk
+
+
+# ── BTC spot tracker ──────────────────────────────────────────────────────────
+
+class BtcSpotTracker:
+    COINBASE_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+
+    def __init__(self, history_secs: int = 1800):
+        self.history  = deque(maxlen=history_secs * 2)
+        self._lock    = threading.Lock()
+        self._running = False
+        self._thread  = None
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        log("BTC spot tracker started (BRTI)")
+
+    def stop(self):
+        self._running = False
 
-# ── Kalshi credentials ────────────────────────────────────────────────────────
-
-
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-N_SIMS            = 500_000
-STEPS_PER_MIN     = 6
-MINUTES_PER_YEAR  = 525_600
-BASE_URL          = "https://api.elections.kalshi.com/trade-api/v2"
-LOG_FILE          = "kalshi_btc_3.txt"
-VOL_CAP           = 2.00
-FALLBACK_VOL      = 0.80
-VOL_LOW_THRESHOLD = 0.20
-VOL_MIN_MINS      = 15
-PREFETCH_SECS     = 30
-SETTLE_WAIT_SECS  = 60
-MARKET_RETRY_SECS = 5
-MARKET_MAX_TRIES  = 20
-
-FIRE_OFFSETS_SECS = [40, 60, 120, 180, 240, 270, 360, 480, 600]
-
-# F1–F6 are observation-only fires (first 4.5 min of market)
-# F7–F9 are the decision fires (~9 min, ~7.5 min, ~5 min remaining)
-DECISION_FIRES    = (7, 8, 9)
-
-# ── Bet sizing ────────────────────────────────────────────────────────────────
-
-BET_AMOUNT_DOLLARS = 100.00  # dollars to risk per bet (contracts calculated from price)
-BALANCE_FLOOR    = 40.00  # stop all betting if balance drops to or below this
-MAX_YES_PRICE    = 97     # cents — refuse to buy YES above this
-MIN_YES_PRICE    = 3      # cents — refuse to buy NO above equivalent ceiling
-
-# ── Strategy rules ────────────────────────────────────────────────────────────
-
-TRADE_WINDOW_START  = (9,  45)
-TRADE_WINDOW_END    = (18, 45)
-VOL_FLOOR           = 0.15
-VOL_PCT_MAX         = 5.00
-
-VOL_ACCEL_SHORT_MINS  = 15
-VOL_ACCEL_LONG_MINS   = 60
-VOL_ACCEL_THRESHOLD   = 1.5
-
-CONF_MIN_F7         = 0.75
-CONF_MIN_F8         = 0.75
-CONF_MIN_F9         = 0.75
-AGREE_FIRES         = {7, 8, 9}
-AUTOCORR_MIN        = -0.25
-
-EV_MIN_THRESHOLD    = 0.00
-
-PRIOR_SIGMA_THRESH     = 2.0
-CONF_MIN_F9_BOOSTED    = 0.88
-PRIOR_SIGMA_HARD_BLOCK = 3.0
-
-DECEL_THRESHOLD    = 0.40
-DECEL_MIN_VELOCITY = 5.0
-
-REVERSAL_GUARD_SIGMA = 0.40
-
-KALSHI_DRIFT_THRESHOLD = 0.05
-
-
-# ── Module-level state (prior market tracking) ────────────────────────────────
-
-_prior_lock              = threading.Lock()
-_prior_market_f1_spot: float | None = None
-_prior_market_f6_spot: float | None = None
-_prior_market_sigma:   float | None = None
-
-def get_prior_market() -> tuple:
-    with _prior_lock:
-        return _prior_market_f1_spot, _prior_market_f6_spot, _prior_market_sigma
-
-def set_prior_market(f1_spot: float, f6_spot: float, sigma: float):
-    global _prior_market_f1_spot, _prior_market_f6_spot, _prior_market_sigma
-    with _prior_lock:
-        _prior_market_f1_spot = f1_spot
-        _prior_market_f6_spot = f6_spot
-        _prior_market_sigma   = sigma
-
-
-# ── Model parameters dataclass ────────────────────────────────────────────────
-
-@dataclasses.dataclass
-class ModelParams:
-    real_vol:    float
-    garch_omega: float
-    garch_alpha: float
-    garch_beta:  float
-    garch_var0:  float
-    t_df:        float
-    jump_lambda: float
-    jump_mu:     float
-    jump_sigma:  float
-
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-log_lock = threading.Lock()
-
-def log(line: str):
-    ts        = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_line = f"[{ts}] {line}"
-    with log_lock:
-        print(full_line)
-        with open(LOG_FILE, "a") as f:
-            f.write(full_line + "\n")
-
-
-# ── Session / time helpers ────────────────────────────────────────────────────
-
-def utc_offset() -> int:
-    return 4 if _time.localtime().tm_isdst else 5
-
-def now_est() -> datetime.datetime:
-    return datetime.datetime.utcnow() - datetime.timedelta(hours=utc_offset())
-
-def in_trade_window() -> bool:
-    t     = now_est()
-    mins  = t.hour * 60 + t.minute
-    start = TRADE_WINDOW_START[0] * 60 + TRADE_WINDOW_START[1]
-    end   = TRADE_WINDOW_END[0]   * 60 + TRADE_WINDOW_END[1]
-    return start <= mins < end
-
-def session_elapsed_mins() -> int:
-    t     = now_est()
-    mins  = t.hour * 60 + t.minute
-    start = TRADE_WINDOW_START[0] * 60 + TRADE_WINDOW_START[1]
-    return max(mins - start, VOL_MIN_MINS) if mins >= start else VOL_MIN_MINS
-
-def next_boundary_utc() -> datetime.datetime:
-    now    = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-    next_b = (now.minute // 15 + 1) * 15
-    if next_b >= 60:
-        return now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
-    return now.replace(minute=next_b, second=0, microsecond=0)
-
-def sleep_until(target: datetime.datetime):
-    secs = (target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-    if secs > 0:
-        time.sleep(secs)
-
-
-# ── Vol calculation ───────────────────────────────────────────────────────────
-
-def compute_vol_from_candles(candles: list) -> float:
-    if len(candles) < 6:
-        return FALLBACK_VOL
-    opens  = np.array([float(c[1]) for c in candles])
-    highs  = np.array([float(c[2]) for c in candles])
-    lows   = np.array([float(c[3]) for c in candles])
-    closes = np.array([float(c[4]) for c in candles])
-    n      = len(candles)
-    highs  = np.clip(highs, None, np.percentile(highs, 99))
-    lows   = np.clip(lows,  np.percentile(lows, 1), None)
-    overnight  = np.log(opens[1:] / closes[:-1])
-    open_close = np.log(closes[1:] / opens[1:])
-    rs = (np.log(highs[1:] / closes[1:]) * np.log(highs[1:] / opens[1:]) +
-          np.log(lows[1:]  / closes[1:]) * np.log(lows[1:]  / opens[1:]))
-    k   = 0.34 / (1.34 + (n + 1) / (n - 1))
-    var = max(float(np.var(overnight, ddof=1)) +
-              k * float(np.var(open_close, ddof=1)) +
-              (1 - k) * float(np.median(rs)), 1e-10)
-    return min(math.sqrt(var * MINUTES_PER_YEAR), VOL_CAP)
-
-
-def compute_autocorr(ohlc: list, lags: int = 20) -> float | None:
-    if len(ohlc) < lags + 2:
-        return None
-    closes  = np.array([float(c[4]) for c in ohlc[-(lags + 1):]])
-    returns = np.diff(np.log(closes))
-    if len(returns) < 4:
-        return None
-    r_t  = returns[:-1]
-    r_t1 = returns[1:]
-    if np.std(r_t) == 0 or np.std(r_t1) == 0:
-        return None
-    return float(np.corrcoef(r_t, r_t1)[0, 1])
-
-
-def compute_vol_acceleration(ohlc: list) -> tuple | None:
-    if len(ohlc) < VOL_ACCEL_LONG_MINS + 2:
-        return None
-    short_candles = ohlc[-VOL_ACCEL_SHORT_MINS:]
-    long_candles  = ohlc[-VOL_ACCEL_LONG_MINS:]
-    if len(short_candles) < 6 or len(long_candles) < 6:
-        return None
-    short_vol = compute_vol_from_candles(short_candles)
-    long_vol  = compute_vol_from_candles(long_candles)
-    if long_vol <= 0:
-        return None
-    ratio = short_vol / long_vol
-    return short_vol, long_vol, ratio
-
-
-def fetch_vol_and_volume() -> tuple:
-    now_ts    = int(datetime.datetime.utcnow().timestamp())
-    since_old = now_ts - (1440 * 60)
-    since_new = now_ts - (720 * 60)
-
-    def _candles(since):
-        r = requests.get("https://api.kraken.com/0/public/OHLC",
-                         params={"pair": "XBTUSD", "interval": 1, "since": since}, timeout=8)
-        r.raise_for_status()
-        return next((v for k, v in r.json().get("result", {}).items() if k != "last"), [])
-
-    b1, b2 = _candles(since_old), _candles(since_new)
-    seen, merged = set(), []
-    for c in b1 + b2:
-        if c[0] not in seen:
-            seen.add(c[0]); merged.append(c)
-    ohlc = sorted(merged, key=lambda c: c[0]) if merged else []
-
-    vol_mins = session_elapsed_mins()
-    real_vol = compute_vol_from_candles(ohlc[-vol_mins:]) if ohlc else FALLBACK_VOL
-
-    vol_pct = None
-    vol_lbl = "n/a"
-    if len(ohlc) >= 30:
-        vols   = [float(c[6]) for c in ohlc]
-        avg    = float(np.mean(vols))
-        recent = float(np.mean([float(c[6]) for c in ohlc[-5:]]))
-        if avg > 0:
-            vol_pct = recent / avg
-            pct     = vol_pct * 100
-            flag    = ("⚠ thin" if vol_pct < VOL_LOW_THRESHOLD else
-                       "~ low"  if vol_pct < 0.5 else
-                       "✓ ok"   if vol_pct < 1.5 else "↑ high")
-            vol_lbl = f"{pct:.0f}% of 721m avg ({flag})"
-
-    return real_vol, vol_pct, vol_lbl, ohlc
-
-
-def fit_model_params(ohlc: list, real_vol: float) -> ModelParams:
-    var0_default = real_vol ** 2 / MINUTES_PER_YEAR
-    default = ModelParams(
-        real_vol=real_vol, garch_omega=var0_default*0.05,
-        garch_alpha=0.10, garch_beta=0.85, garch_var0=var0_default,
-        t_df=5.0, jump_lambda=0.003, jump_mu=0.0, jump_sigma=0.015,
-    )
-    if len(ohlc) < 60:
-        return default
-    closes  = np.array([float(c[4]) for c in ohlc])
-    returns = np.diff(np.log(closes))
-    if len(returns) < 30:
-        return default
-
-    try:
-        df, _, _ = stats.t.fit(returns, floc=0)
-        t_df = float(np.clip(df, 2.5, 30.0))
-    except Exception:
-        t_df = default.t_df
-
-    std = float(np.std(returns))
-    if std > 0:
-        jump_mask   = np.abs(returns) > 3.0 * std
-        n_jumps     = int(np.sum(jump_mask))
-        jump_lambda = max(float(n_jumps / len(returns)), 1e-4)
-        if n_jumps >= 3:
-            jump_sizes = returns[jump_mask]
-            jump_mu    = float(np.mean(jump_sizes))
-            jump_sigma = float(np.std(jump_sizes))
-        else:
-            jump_mu, jump_sigma = default.jump_mu, default.jump_sigma
-    else:
-        jump_lambda, jump_mu, jump_sigma = default.jump_lambda, default.jump_mu, default.jump_sigma
-
-    diffusion_ret = np.where(np.abs(returns) > 3.0 * std, 0.0, returns) if std > 0 else returns
-    n             = len(diffusion_ret)
-    var_init      = float(np.var(diffusion_ret)) or var0_default
-
-    try:
-        def neg_loglik(params):
-            omega, alpha, beta = params
-            if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.9999:
-                return 1e15
-            sigma2    = np.empty(n)
-            sigma2[0] = var_init
-            for t in range(1, n):
-                sigma2[t] = omega + alpha * diffusion_ret[t-1]**2 + beta * sigma2[t-1]
-            if np.any(sigma2 <= 0):
-                return 1e15
-            return float(0.5 * np.sum(np.log(sigma2) + diffusion_ret**2 / sigma2))
-
-        result = optimize.minimize(
-            neg_loglik, x0=[var_init*0.05, 0.10, 0.85], method='L-BFGS-B',
-            bounds=[(1e-12, var_init), (0.001, 0.4), (0.5, 0.999)],
-        )
-        if result.success and result.fun < 1e14:
-            omega, alpha, beta = result.x
-            sigma2    = np.empty(n)
-            sigma2[0] = var_init
-            for t in range(1, n):
-                sigma2[t] = omega + alpha * diffusion_ret[t-1]**2 + beta * sigma2[t-1]
-            garch_var0 = float(sigma2[-1])
-        else:
-            omega, alpha, beta = default.garch_omega, default.garch_alpha, default.garch_beta
-            garch_var0 = var_init
-    except Exception:
-        omega, alpha, beta = default.garch_omega, default.garch_alpha, default.garch_beta
-        garch_var0 = var_init
-
-    return ModelParams(
-        real_vol=real_vol, garch_omega=float(omega), garch_alpha=float(alpha),
-        garch_beta=float(beta), garch_var0=float(garch_var0), t_df=t_df,
-        jump_lambda=jump_lambda, jump_mu=jump_mu, jump_sigma=jump_sigma,
-    )
-
-
-def fetch_deribit_vol() -> float | None:
-    try:
-        r = requests.get("https://www.deribit.com/api/v2/public/get_index_price",
-                         params={"index_name": "dvol_btc"}, timeout=6)
-        r.raise_for_status()
-        dvol = r.json().get("result", {}).get("index_price")
-        return dvol / 100.0 if dvol else None
-    except Exception:
-        return None
-
-
-# ── Kalshi auth ───────────────────────────────────────────────────────────────
-
-def _kalshi_auth_headers(method: str, path: str) -> dict:
-    key     = serialization.load_pem_private_key(KALSHI_PRIVATE_KEY, password=None)
-    ts      = str(int(_time.time() * 1000))
-    msg     = f"{ts}{method.upper()}{path}".encode("utf-8")
-    sig_b64 = base64.b64encode(
-        key.sign(msg, asym_padding.PSS(
-            mgf=asym_padding.MGF1(hashes.SHA256()),
-            salt_length=asym_padding.PSS.MAX_LENGTH
-        ), hashes.SHA256())
-    ).decode()
-    return {
-        "Content-Type":            "application/json",
-        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-    }
-
-
-# ── Kalshi API ────────────────────────────────────────────────────────────────
-
-def get_balance() -> float:
-    """Fetch current account balance in dollars. Raises on failure."""
-    path = "/trade-api/v2/portfolio/balance"
-    r    = requests.get(f"https://api.elections.kalshi.com{path}",
-                        headers=_kalshi_auth_headers("GET", path), timeout=8)
-    r.raise_for_status()
-    return r.json().get("balance", 0) / 100
-
-
-def place_order(ticker: str, direction: str,
-                yes_ask: float, no_ask: float) -> dict | None:
-    """
-    Place a limit buy order on Kalshi.
-    - Checks live balance first; halts program entirely if at or below BALANCE_FLOOR.
-    - direction == "ABOVE" → buy YES at yes_ask price
-    - direction == "BELOW" → buy NO  at no_ask price
-    - Bets BET_AMOUNT_DOLLARS, rounded down to whole contracts.
-    """
-    # ── Balance check — halt program if floor reached ──────────────────────
-    try:
-        balance = get_balance()
-        log(f"  💰 Balance: ${balance:,.2f}")
-        if balance <= BALANCE_FLOOR:
-            log(f"  🛑 BALANCE FLOOR HIT — ${balance:,.2f} at or below "
-                f"${BALANCE_FLOOR:.2f} minimum. Shutting down.")
-            sys.exit(1)
-    except Exception as e:
-        log(f"  ⚠ Could not verify balance before order: {e} — skipping order for safety")
-        return None
-
-    # ── Pick side and price ────────────────────────────────────────────────
-    if direction == "ABOVE":
-        side       = "yes"
-        price_frac = yes_ask
-    else:
-        side       = "no"
-        price_frac = no_ask
-
-    price_cents = round(price_frac * 100)
-
-    if side == "yes" and price_cents > MAX_YES_PRICE:
-        log(f"  ⚠ ORDER SKIPPED — YES price {price_cents}¢ > {MAX_YES_PRICE}¢ ceiling")
-        return None
-    if side == "no" and price_cents > (100 - MIN_YES_PRICE):
-        log(f"  ⚠ ORDER SKIPPED — NO price {price_cents}¢ > {100 - MIN_YES_PRICE}¢ ceiling")
-        return None
-
-    # ── Calculate contracts from dollar amount ─────────────────────────────
-    contracts = int(BET_AMOUNT_DOLLARS / price_frac)
-    if contracts < 1:
-        log(f"  ⚠ ORDER SKIPPED — ${BET_AMOUNT_DOLLARS:.2f} not enough to buy "
-            f"even 1 contract at {price_cents}¢")
-        return None
-
-    actual_payout = float(contracts)
-    actual_profit = actual_payout - (contracts * price_frac)
-
-    # ── Place the order ────────────────────────────────────────────────────
-    path    = "/trade-api/v2/portfolio/orders"
-    payload = {
-        "ticker":          ticker,
-        "client_order_id": str(uuid.uuid4()),
-        "action":          "buy",
-        "side":            side,
-        "type":            "limit",
-        "count":           contracts,
-        "yes_price":       price_cents if side == "yes" else (100 - price_cents),
-    }
-
-    try:
-        r = requests.post(f"https://api.elections.kalshi.com{path}",
-                          headers=_kalshi_auth_headers("POST", path),
-                          json=payload, timeout=8)
-        if r.status_code == 201:
-            order = r.json().get("order", {})
-            log(f"  ✅ ORDER PLACED — {side.upper()} x{contracts} @ {price_cents}¢ "
-                f"| ${actual_payout:.2f} payout (+${actual_profit:.2f} profit) "
-                f"| order_id: {order.get('order_id', '?')} "
-                f"| status: {order.get('status', '?')}")
-            return order
-        else:
-            log(f"  ❌ ORDER FAILED — HTTP {r.status_code}: {r.text[:200]}")
-            return None
-    except Exception as e:
-        log(f"  ❌ ORDER EXCEPTION — {type(e).__name__}: {e}")
-        return None
-
-
-def find_series_ticker() -> str:
-    r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/series/",
-                     params={"limit": 200},
-                     headers={"accept": "application/json"}, timeout=8)
-    r.raise_for_status()
-    for s in r.json().get("series") or []:
-        if "btc15m" in (s.get("ticker") or "").lower():
-            return s["ticker"]
-    raise ValueError("btc15m series not found")
-
-def get_fresh_market(series_ticker: str):
-    for attempt in range(MARKET_MAX_TRIES):
-        try:
-            r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets/",
-                             params={"series_ticker": series_ticker, "status": "open", "limit": 100},
-                             headers={"accept": "application/json"}, timeout=8)
-            r.raise_for_status()
-            markets = r.json().get("markets", [])
-            now     = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-            fresh   = [m for m in markets if m.get("close_time") and
-                       (datetime.datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")) - now
-                        ).total_seconds() > 840]
-            if fresh:
-                m          = min(fresh, key=lambda m: m["close_time"])
-                close_time = datetime.datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
-                mins_rem   = (close_time - now).total_seconds() / 60
-                strike     = m.get("floor_strike")
-                if strike:
-                    return m["ticker"], float(strike), close_time, mins_rem
-        except Exception as e:
-            if attempt == MARKET_MAX_TRIES - 1:
-                raise
-        time.sleep(MARKET_RETRY_SECS)
-    raise ValueError("No fresh market found after retries")
-
-def fetch_kalshi_prices(ticker: str) -> dict | None:
-    try:
-        r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
-                         headers={"accept": "application/json"}, timeout=5)
-        if r.status_code != 200:
-            log(f"  ⚠ Kalshi price fetch HTTP {r.status_code}: {r.text[:120]}")
-            return None
-        m = r.json().get("market", {})
-
-        def to_frac(v):
+    def _fetch_price(self) -> "float | None":
+        for method in ("get_live_brti", "get_brti", "calculate_brti_fast"):
             try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        yes_bid = to_frac(m.get("yes_bid_dollars"))
-        yes_ask = to_frac(m.get("yes_ask_dollars"))
-        no_bid  = to_frac(m.get("no_bid_dollars"))
-        no_ask  = to_frac(m.get("no_ask_dollars"))
-
-        if yes_bid is not None and yes_ask is not None:
-            return {"yes_bid": yes_bid, "yes_ask": yes_ask,
-                    "no_bid":  no_bid,  "no_ask":  no_ask}
-
-        price_keys = {k: v for k, v in m.items()
-                      if any(x in k.lower() for x in ("bid", "ask", "price", "yes", "no"))}
-        log(f"  ⚠ Kalshi price fields null. Price-related keys in response: {price_keys}")
-        return None
-    except Exception as e:
-        log(f"  ⚠ Kalshi price fetch exception: {type(e).__name__}: {e}")
-        return None
-
-def get_market_result(ticker: str) -> str | None:
-    r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
-                     headers={"accept": "application/json"}, timeout=8)
-    r.raise_for_status()
-    result = r.json().get("market", {}).get("result", "")
-    return result if result in ("yes", "no") else None
-
-
-# ── Simulation ────────────────────────────────────────────────────────────────
-
-def run_simulation(spot: float, horizon_mins: float,
-                   params: ModelParams, vol_scale: float = 1.0) -> np.ndarray:
-    total_steps = max(1, round(horizon_mins))
-    persistence = params.garch_alpha + params.garch_beta
-    uncond_var  = (params.garch_omega / (1.0 - persistence)
-                   if persistence < 1.0 else params.garch_var0)
-    sigma2_path = np.array([
-        uncond_var + (persistence ** k) * (params.garch_var0 - uncond_var)
-        for k in range(total_steps)
-    ], dtype=np.float64)
-    sigma2_path = np.maximum(sigma2_path * vol_scale, 1e-12)
-    sigma_path  = np.sqrt(sigma2_path)
-    drift_path  = -0.5 * sigma2_path
-
-    half = N_SIMS // 2
-    if params.t_df < 29.0:
-        raw_half  = stats.t.rvs(df=params.t_df, size=(half, total_steps))
-        raw_half /= math.sqrt(params.t_df / (params.t_df - 2.0))
-    else:
-        raw_half = np.random.standard_normal((half, total_steps))
-    raw = np.concatenate([raw_half, -raw_half], axis=0)
-
-    log_returns = drift_path[np.newaxis, :] + sigma_path[np.newaxis, :] * raw
-
-    if params.jump_lambda > 0.0 and params.jump_sigma > 0.0:
-        n_jumps      = np.random.poisson(params.jump_lambda, (N_SIMS, total_steps))
-        jump_sizes   = np.random.normal(params.jump_mu, params.jump_sigma, (N_SIMS, total_steps))
-        jump_returns = np.where(n_jumps > 0, jump_sizes, 0.0)
-        jump_comp    = params.jump_lambda * (
-            math.exp(params.jump_mu + 0.5 * params.jump_sigma ** 2) - 1.0)
-        log_returns += jump_returns - jump_comp
-
-    return np.exp(np.log(spot) + log_returns.sum(axis=1))
-
-
-# ── Result fetcher (background thread) ───────────────────────────────────────
-
-def fetch_result_async(ticker: str, strike: float, prediction: str,
-                       close_time: datetime.datetime, p_above: float, p_below: float):
-    settle_time = close_time + datetime.timedelta(seconds=SETTLE_WAIT_SECS)
-    sleep_until(settle_time)
-    for attempt in range(10):
+                fn = getattr(brti_btc, method, None)
+                if fn:
+                    price = fn() if method != "calculate_brti_fast" else fn(verbose=False)
+                    if price is not None and float(price) > 10_000:
+                        return float(price)
+            except Exception:
+                pass
         try:
-            result = get_market_result(ticker)
-            if result:
-                actual  = "ABOVE" if result == "yes" else "BELOW"
-                correct = prediction.split("#")[0] == actual
-                log(f"  RESULT [{ticker}] #{prediction.split('#')[1] if '#' in prediction else '?'} "
-                    f"Actual: {actual} | "
-                    f"{'✓ CORRECT' if correct else '✗ WRONG'} "
-                    f"(predicted {prediction.split('#')[0]} at {max(p_above, p_below)*100:.1f}%)")
-                return
+            r = requests.get(self.COINBASE_URL, timeout=5)
+            if r.status_code == 200:
+                price = float(r.json()["data"]["amount"])
+                if price > 10_000:
+                    return price
         except Exception:
             pass
-        time.sleep(15)
-    log(f"  RESULT [{ticker}] ERROR: could not fetch result")
-
-
-# ── Pre-fetch worker ──────────────────────────────────────────────────────────
-
-def prefetch_all() -> dict:
-    result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        f_vol  = ex.submit(fetch_vol_and_volume)
-        f_brti = ex.submit(calculate_brti_fast, False)
-        f_dvol = ex.submit(fetch_deribit_vol)
-
-        ohlc = []
-        try:
-            real_vol, vol_pct, vol_lbl, ohlc = f_vol.result(timeout=10)
-            result["real_vol"] = real_vol
-            result["vol_pct"]  = vol_pct
-            result["vol_lbl"]  = vol_lbl
-        except Exception as e:
-            result["real_vol"] = FALLBACK_VOL
-            result["vol_lbl"]  = f"fallback ({e})"
-
-        try:
-            result["spot"] = f_brti.result(timeout=10)
-        except Exception:
-            result["spot"] = None
-
-        try:
-            result["impl_vol"] = f_dvol.result(timeout=8)
-        except Exception:
-            result["impl_vol"] = None
-
-    try:
-        result["model"] = fit_model_params(ohlc, result.get("real_vol", FALLBACK_VOL))
-    except Exception:
-        result["model"] = None
-
-    try:
-        result["autocorr"] = compute_autocorr(ohlc, lags=20)
-    except Exception:
-        result["autocorr"] = None
-
-    try:
-        result["vol_accel"] = compute_vol_acceleration(ohlc)
-    except Exception:
-        result["vol_accel"] = None
-
-    return result
-
-
-# ── Kraken spot fetch ─────────────────────────────────────────────────────────
-
-def fetch_kraken_spot() -> float:
-    r = requests.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": "XBTUSD"}, timeout=5)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Kraken error: {data['error']}")
-    return float(next(iter(data["result"].values()))["c"][0])
-
-
-# ── Single fire ───────────────────────────────────────────────────────────────
-
-def fire_prediction(ticker: str, strike: float, close_time: datetime.datetime,
-                    fire_num: int, vol_str: str,
-                    params: ModelParams, vol_scale: float) -> tuple | None:
-    now      = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-    mins_rem = (close_time - now).total_seconds() / 60
-
-    try:
-        spot = fetch_kraken_spot()
-    except Exception as e:
-        log(f"  FIRE #{fire_num} ERROR fetching spot: {e}")
         return None
 
-    display_vol = params.real_vol * math.sqrt(vol_scale)
-    sigma_move  = spot * display_vol * math.sqrt(mins_rem / MINUTES_PER_YEAR)
-    finals      = run_simulation(spot, mins_rem, params, vol_scale)
-    p_above     = float((finals > strike).mean())
-    p_below     = 1.0 - p_above
-    prediction  = "ABOVE" if p_above >= p_below else "BELOW"
-
-    log(f"  FIRE #{fire_num} [{mins_rem:.1f}min left] Spot:${spot:,.2f} | "
-        f"PREDICT {prediction} | P(above):{p_above*100:.1f}% P(below):{p_below*100:.1f}% | "
-        f"1σ:±${sigma_move:,.0f}")
-
-    threading.Thread(
-        target=fetch_result_async,
-        args=(ticker, strike, f"{prediction}#{fire_num}", close_time, p_above, p_below),
-        daemon=True
-    ).start()
-
-    return prediction, p_above, p_below, spot, sigma_move
-
-
-# ── One market cycle ──────────────────────────────────────────────────────────
-
-def run_market_cycle(series_ticker: str, prefetched: dict, boundary: datetime.datetime):
-    real_vol  = prefetched.get("real_vol", FALLBACK_VOL)
-    vol_pct   = prefetched.get("vol_pct")
-    impl_vol  = prefetched.get("impl_vol")
-    vol_lbl   = prefetched.get("vol_lbl", "n/a")
-    model     = prefetched.get("model")
-    autocorr  = prefetched.get("autocorr")
-    vol_accel = prefetched.get("vol_accel")
-
-    if impl_vol:
-        final_vol = 0.5 * real_vol + 0.5 * impl_vol
-        vol_str   = f"real:{real_vol*100:.1f}% impl:{impl_vol*100:.1f}% blend:{final_vol*100:.1f}%"
-    else:
-        final_vol = real_vol
-        vol_str   = f"real:{real_vol*100:.1f}% (no Deribit)"
-
-    vol_scale = (final_vol / model.real_vol) ** 2 if (model and model.real_vol > 0) else 1.0
-
-    if model is None:
-        model = ModelParams(
-            real_vol=real_vol, garch_omega=real_vol**2/MINUTES_PER_YEAR*0.05,
-            garch_alpha=0.10, garch_beta=0.85, garch_var0=real_vol**2/MINUTES_PER_YEAR,
-            t_df=30.0, jump_lambda=0.0, jump_mu=0.0, jump_sigma=0.0,
-        )
-
-    # ── Rule 1: Time window ────────────────────────────────────────────────
-    if not in_trade_window():
-        est    = now_est()
-        reason = f"{est.strftime('%I:%M%p')} EST, window 9:45am–6:45pm"
-        log(f"  STRATEGY SKIP — outside window ({reason})")
-        sleep_until(boundary + datetime.timedelta(seconds=FIRE_OFFSETS_SECS[-1]))
-        return
-
-    # ── Rule 2: Vol floor ──────────────────────────────────────────────────
-    if real_vol < VOL_FLOOR:
-        log(f"  STRATEGY SKIP — R.Vol {real_vol*100:.1f}% < {VOL_FLOOR*100:.0f}% floor")
-        sleep_until(boundary + datetime.timedelta(seconds=FIRE_OFFSETS_SECS[-1]))
-        return
-
-    # ── Rule 3: Vol ceiling ────────────────────────────────────────────────
-    if vol_pct is not None and vol_pct > VOL_PCT_MAX:
-        log(f"  STRATEGY SKIP — Volume {vol_pct*100:.0f}% > {VOL_PCT_MAX*100:.0f}% ceiling "
-            f"(extreme spike — unreliable market conditions)")
-        sleep_until(boundary + datetime.timedelta(seconds=FIRE_OFFSETS_SECS[-1]))
-        return
-
-    # ── Rule 4: Vol acceleration ───────────────────────────────────────────
-    if vol_accel is not None:
-        short_vol, long_vol, accel_ratio = vol_accel
-        accel_str = (f"vol {VOL_ACCEL_SHORT_MINS}m:{short_vol*100:.1f}% "
-                     f"vs {VOL_ACCEL_LONG_MINS}m:{long_vol*100:.1f}% "
-                     f"(ratio:{accel_ratio:.2f}x)")
-        if accel_ratio > VOL_ACCEL_THRESHOLD:
-            log(f"  STRATEGY SKIP — Vol acceleration: {accel_str} "
-                f"> {VOL_ACCEL_THRESHOLD:.1f}x threshold (regime shift in progress)")
-            sleep_until(boundary + datetime.timedelta(seconds=FIRE_OFFSETS_SECS[-1]))
-            return
-        log(f"  ✓ Vol accel OK: {accel_str}")
-    else:
-        log(f"  ⚠ Vol accel unavailable (insufficient candle history) — proceeding")
-
-    # ── Fire all 9 predictions ─────────────────────────────────────────────
-    ticker           = None
-    strike           = None
-    close_time       = None
-    fire_results     = {}
-    kalshi_snapshots = {}
-
-    for fire_num, offset in enumerate(FIRE_OFFSETS_SECS, start=1):
-        sleep_until(boundary + datetime.timedelta(seconds=offset))
-        if ticker is None:
+    def _loop(self):
+        while self._running:
             try:
-                ticker, strike, close_time, mins_rem = get_fresh_market(series_ticker)
-                log(f"MARKET  {ticker} | Strike:${strike:,.2f} | Vol:{vol_str} | Volume:{vol_lbl}")
-            except Exception as e:
-                log(f"ERROR getting market: {e}")
-                return
-        result = fire_prediction(ticker, strike, close_time, fire_num, vol_str, model, vol_scale)
-        if result is not None:
-            fire_results[fire_num] = result
-        if fire_num in (7, 8, 9) and ticker is not None:
-            snap = fetch_kalshi_prices(ticker)
-            if snap:
-                kalshi_snapshots[fire_num] = snap
+                price = self._fetch_price()
+                if price is not None:
+                    with self._lock:
+                        self.history.append((time.time(), float(price)))
+            except Exception:
+                pass
+            time.sleep(2)
 
-    # ── Rules 5 & 6: Agreement and confidence ─────────────────────────────
-    f7 = fire_results.get(7)
-    f8 = fire_results.get(8)
-    f9 = fire_results.get(9)
+    def latest(self) -> "float | None":
+        with self._lock:
+            return self.history[-1][1] if self.history else None
 
-    if f7 is None or f8 is None or f9 is None:
-        log("  STRATEGY SKIP — missing F7/F8/F9 data")
-        return
+    def momentum(self, lookback_secs: int = 60) -> "float | None":
+        with self._lock:
+            if len(self.history) < 2:
+                return None
+            cutoff = time.time() - lookback_secs
+            oldest = next(((ts, px) for ts, px in self.history if ts >= cutoff), None)
+            if oldest is None:
+                return None
+            newest  = self.history[-1]
+            elapsed = newest[0] - oldest[0]
+            return (newest[1] - oldest[1]) / elapsed if elapsed >= 1 else None
 
-    dir7, pa7, pb7, spot7, sigma7 = f7
-    dir8, pa8, pb8, spot8, sigma8 = f8  # noqa
-    dir9, pa9, pb9, spot9, sigma9 = f9  # noqa
+    def distance_from_strike(self, strike: float) -> "float | None":
+        price = self.latest()
+        return (price - strike) if (price is not None and strike is not None) else None
 
-    conf7 = max(pa7, pb7)
-    conf8 = max(pa8, pb8)
-    conf9 = max(pa9, pb9)
+    def change_over_mins(self, mins: int = 5) -> "tuple[float | None, float | None]":
+        with self._lock:
+            if len(self.history) < 2:
+                return None, None
+            cutoff = time.time() - (mins * 60)
+            oldest = next((px for ts, px in self.history if ts >= cutoff), None)
+            if oldest is None:
+                return None, None
+            net = self.history[-1][1] - oldest
+            return abs(net), net
 
-    if not (dir7 == dir8 == dir9):
-        log(f"  STRATEGY SKIP — F7/F8/F9 disagree (F7:{dir7} F8:{dir8} F9:{dir9})")
-        _update_prior(fire_results)
-        return
+    def range_over_secs(self, lookback_secs: int) -> "tuple[float | None, float | None, float | None]":
+        """Return high-low range, low, high over the requested lookback.
 
-    if conf7 < CONF_MIN_F7 or conf8 < CONF_MIN_F8 or conf9 < CONF_MIN_F9:
-        log(f"  STRATEGY SKIP — confidence too low "
-            f"(F7:{conf7*100:.1f}% need ≥{CONF_MIN_F7*100:.0f}%, "
-            f"F8:{conf8*100:.1f}% need ≥{CONF_MIN_F8*100:.0f}%, "
-            f"F9:{conf9*100:.1f}% need ≥{CONF_MIN_F9*100:.0f}%)")
-        _update_prior(fire_results)
-        return
+        Unlike change_over_mins(), this catches V-shaped moves where BTC starts
+        and ends near the same price but travels a large distance in between.
+        """
+        with self._lock:
+            if len(self.history) < 2:
+                return None, None, None
+            cutoff = time.time() - lookback_secs
+            prices = [px for ts, px in self.history if ts >= cutoff]
+            if len(prices) < 2:
+                return None, None, None
+            low = min(prices)
+            high = max(prices)
+            return high - low, low, high
 
-    direction  = dir9
-    model_prob = pa9 if direction == "ABOVE" else pb9
+    def max_range_window(self, lookback_secs: int,
+                         window_secs: int) -> "tuple[float | None, float | None, float | None]":
+        """Return the largest high-low move found in any rolling window.
 
-    # ── Rule 7: Autocorrelation regime ────────────────────────────────────
-    if autocorr is not None and autocorr < AUTOCORR_MIN:
-        log(f"  STRATEGY SKIP — autocorr={autocorr:+.2f} < {AUTOCORR_MIN:+.2f} "
-            f"(deep mean-reverting regime — momentum signal unreliable)")
-        _update_prior(fire_results)
-        return
+        Example: lookback_secs=900 and window_secs=180 scans the last 15 minutes
+        and returns the largest move that occurred inside any 3-minute slice.
+        """
+        with self._lock:
+            if len(self.history) < 2:
+                return None, None, None
 
-    # ── Rule 8: Expected value (informational only) ────────────────────────
-    kalshi_prices = kalshi_snapshots.get(9) or fetch_kalshi_prices(ticker)
-    ev = None
-    if kalshi_prices:
-        contract_ask = (kalshi_prices["yes_ask"] if direction == "ABOVE"
-                        else kalshi_prices["no_ask"])
-        if contract_ask and contract_ask > 0:
-            ev = model_prob - contract_ask
-            regime_str = (f"autocorr={autocorr:+.2f}" if autocorr is not None else "autocorr=n/a")
-            log(f"  📊 Kalshi: YES {kalshi_prices['yes_bid']*100:.0f}¢/{kalshi_prices['yes_ask']*100:.0f}¢  "
-                f"NO {kalshi_prices['no_bid']*100:.0f}¢/{kalshi_prices['no_ask']*100:.0f}¢  "
-                f"| EV:{ev*100:+.1f}¢  model:{model_prob*100:.1f}%  ask:{contract_ask*100:.0f}¢  "
-                f"| {regime_str}")
-    else:
-        regime_str = (f"autocorr={autocorr:+.2f}" if autocorr is not None else "autocorr=n/a")
-        log(f"  ⚠ Kalshi prices unavailable  | {regime_str}")
+            cutoff = time.time() - lookback_secs
+            points = [(ts, px) for ts, px in self.history if ts >= cutoff]
+            if len(points) < 2:
+                return None, None, None
 
-    # ── Rule 9: Prior market magnitude ────────────────────────────────────
-    prev_f1, prev_f9, prev_sigma = get_prior_market()
-    if prev_f1 and prev_f9 and prev_sigma and prev_sigma > 0:
-        prev_move_sigma = abs(prev_f9 - prev_f1) / prev_sigma
+            best_range = 0.0
+            best_low = None
+            best_high = None
 
-        if prev_move_sigma >= PRIOR_SIGMA_HARD_BLOCK:
-            log(f"  STRATEGY SKIP — prior market moved {prev_move_sigma:.1f}σ "
-                f"≥ {PRIOR_SIGMA_HARD_BLOCK:.0f}σ hard block "
-                f"(regime disruption — skip unconditionally)")
-            _update_prior(fire_results)
+            left = 0
+            window = deque()
+
+            for ts, px in points:
+                window.append((ts, px))
+                while window and window[0][0] < ts - window_secs:
+                    window.popleft()
+
+                if len(window) < 2:
+                    continue
+
+                prices = [p for _, p in window]
+                low = min(prices)
+                high = max(prices)
+                current_range = high - low
+
+                if current_range > best_range:
+                    best_range = current_range
+                    best_low = low
+                    best_high = high
+
+            if best_low is None or best_high is None:
+                return None, None, None
+            return best_range, best_low, best_high
+
+
+# ── Mid-window bounce tracker ─────────────────────────────────────────────────
+
+class BounceTrackerV2:
+    def __init__(self):
+        self.reset(strike=None)
+
+    def reset(self, strike):
+        self._strike            = strike
+        self._started_below     = None
+        self._max_cross_above   = 0.0
+        self._t_remaining_cross = 0
+        self._max_dip_below     = 0.0
+        self._t_remaining_dip   = 0
+
+    def update(self, btc_price: float, t_remaining: float):
+        if self._strike is None or btc_price is None:
             return
-
-        if prev_move_sigma >= PRIOR_SIGMA_THRESH:
-            if conf9 < CONF_MIN_F9_BOOSTED:
-                log(f"  STRATEGY SKIP — prior market moved {prev_move_sigma:.1f}σ "
-                    f"(reversal risk), need F9 ≥ {CONF_MIN_F9_BOOSTED*100:.0f}% "
-                    f"(have {conf9*100:.1f}%)")
-                _update_prior(fire_results)
-                return
-            log(f"  ⚠ Prior move {prev_move_sigma:.1f}σ — raised F9 threshold, passed at {conf9*100:.1f}%")
-
-    # ── Rule 10: Deceleration filter ──────────────────────────────────────
-    f1_res = fire_results.get(1)
-    f5_res = fire_results.get(5)
-    if f1_res and f5_res:
-        spot1      = f1_res[3]
-        spot5      = f5_res[3]
-        time_early = (FIRE_OFFSETS_SECS[4] - FIRE_OFFSETS_SECS[0]) / 60
-        time_late  = (FIRE_OFFSETS_SECS[8] - FIRE_OFFSETS_SECS[4]) / 60
-        early_vel  = (spot5 - spot1) / time_early
-        late_vel   = (spot9 - spot5) / time_late
-        sign       = -1.0 if direction == "BELOW" else 1.0
-        early_move = early_vel * sign
-        late_move  = late_vel  * sign
-        if early_move > DECEL_MIN_VELOCITY:
-            decel_ratio = late_move / early_move
-            if decel_ratio < DECEL_THRESHOLD:
-                log(f"  STRATEGY SKIP — Deceleration: early {early_move:+.1f}$/min → "
-                    f"late {late_move:+.1f}$/min "
-                    f"({decel_ratio*100:.0f}% of early, need ≥{DECEL_THRESHOLD*100:.0f}%)")
-                _update_prior(fire_results)
-                return
-            log(f"  ✓ Momentum OK: early {early_move:+.1f}$/min → late {late_move:+.1f}$/min "
-                f"({decel_ratio*100:.0f}% of early)")
-
-    # ── Rule 11: Reversal guard ────────────────────────────────────────────
-    if direction == "ABOVE":
-        pullback_sigma = (spot8 - spot9) / sigma9
-    else:
-        pullback_sigma = (spot9 - spot8) / sigma9
-
-    if pullback_sigma > REVERSAL_GUARD_SIGMA:
-        log(f"  STRATEGY SKIP — Reversal Guard: F8→F9 pullback={pullback_sigma:.2f}σ "
-            f"> {REVERSAL_GUARD_SIGMA:.2f}σ threshold "
-            f"(spot moved ${abs(spot9-spot8):,.0f} against {direction} between F8 and F9)")
-        _update_prior(fire_results)
-        return
-
-    # ── Rule 12: Kalshi order book drift ──────────────────────────────────
-    snap7 = kalshi_snapshots.get(7)
-    snap8 = kalshi_snapshots.get(8)
-    snap9 = kalshi_snapshots.get(9)
-
-    if snap7 and snap8 and snap9:
-        ya7 = snap7["yes_ask"]
-        ya8 = snap8["yes_ask"]
-        ya9 = snap9["yes_ask"]
-        drift_78  = ya8 - ya7
-        drift_89  = ya9 - ya8
-        drift_tot = ya9 - ya7
-
-        drift_str = (f"YES ask {ya7*100:.0f}¢ → {ya8*100:.0f}¢ → {ya9*100:.0f}¢ "
-                     f"(F7→F8:{drift_78*100:+.0f}¢  F8→F9:{drift_89*100:+.0f}¢  "
-                     f"total:{drift_tot*100:+.0f}¢)")
-
-        if direction == "ABOVE":
-            adv_78  = drift_78  < -KALSHI_DRIFT_THRESHOLD
-            adv_89  = drift_89  < -KALSHI_DRIFT_THRESHOLD
-            adv_tot = drift_tot < -KALSHI_DRIFT_THRESHOLD
-            crowd_word = "selling YES"
+        above = btc_price > self._strike
+        if self._started_below is None:
+            self._started_below = not above
+        if self._started_below:
+            if above:
+                exc = btc_price - self._strike
+                if exc > self._max_cross_above:
+                    self._max_cross_above   = exc
+                    self._t_remaining_cross = t_remaining
         else:
-            adv_78  = drift_78  > KALSHI_DRIFT_THRESHOLD
-            adv_89  = drift_89  > KALSHI_DRIFT_THRESHOLD
-            adv_tot = drift_tot > KALSHI_DRIFT_THRESHOLD
-            crowd_word = "buying YES"
+            if not above:
+                dip = self._strike - btc_price
+                if dip > self._max_dip_below:
+                    self._max_dip_below   = dip
+                    self._t_remaining_dip = t_remaining
 
-        accelerating = adv_78 and adv_89
+    def should_skip(self, side: str) -> "tuple[bool, str]":
+        if side == "no":
+            if (self._started_below
+                    and self._max_cross_above > BOUNCE_MIN_EXCURSION
+                    and self._t_remaining_cross > BOUNCE_MIN_T_REMAINING):
+                return True, (f"price bounced above strike mid-window "
+                              f"(+${self._max_cross_above:,.0f} peak at T-{self._t_remaining_cross:.0f}s)")
+        elif side == "yes":
+            if (self._started_below is False
+                    and self._max_dip_below > BOUNCE_MIN_EXCURSION
+                    and self._t_remaining_dip > BOUNCE_MIN_T_REMAINING):
+                return True, (f"price dipped below strike mid-window "
+                              f"(-${self._max_dip_below:,.0f} peak at T-{self._t_remaining_dip:.0f}s)")
+        return False, ""
 
-        if accelerating:
-            log(f"  STRATEGY SKIP — Kalshi drift accelerating against {direction}: "
-                f"{drift_str} ({crowd_word} in both windows)")
-            _update_prior(fire_results)
+
+class ContestedStrikeTracker:
+    """Tracks meaningful strike crossings inside the current market.
+
+    A price is considered meaningfully above the strike only at +$threshold or
+    higher, and meaningfully below only at -$threshold or lower. Values inside
+    that neutral band do not change state. This prevents tiny flickers around
+    the strike from counting as crosses.
+    """
+
+    def __init__(self, excursion: float = CONTESTED_CROSS_EXCURSION):
+        self._excursion = float(excursion)
+        self.reset(strike=None)
+
+    def reset(self, strike):
+        self._strike = strike
+        self._zone = None  # "above" or "below" after leaving neutral band
+        self._cross_count = 0
+        self._max_above = 0.0
+        self._max_below = 0.0
+        self._last_cross_t_remaining = None
+
+    def update(self, btc_price: float, t_remaining: float):
+        if self._strike is None or btc_price is None:
             return
-        elif adv_tot:
-            log(f"  STRATEGY SKIP — Kalshi drift against {direction}: "
-                f"{drift_str} (total {drift_tot*100:+.0f}¢ exceeds {KALSHI_DRIFT_THRESHOLD*100:.0f}¢ threshold)")
-            _update_prior(fire_results)
-            return
+
+        dist = btc_price - self._strike
+        if dist >= self._excursion:
+            new_zone = "above"
+            self._max_above = max(self._max_above, dist)
+        elif dist <= -self._excursion:
+            new_zone = "below"
+            self._max_below = max(self._max_below, abs(dist))
         else:
-            accel_note = " ⚡ accelerating with us" if (not adv_78 and not adv_89 and
-                         abs(drift_78) > 0.01 and abs(drift_89) > 0.01) else ""
-            log(f"  📈 Kalshi drift OK: {drift_str}{accel_note}")
-
-    elif snap7 and snap9:
-        ya7 = snap7["yes_ask"]
-        ya9 = snap9["yes_ask"]
-        drift_tot = ya9 - ya7
-        drift_str = (f"YES ask {ya7*100:.0f}¢ → {ya9*100:.0f}¢ "
-                     f"(total:{drift_tot*100:+.0f}¢, F8 snapshot unavailable)")
-        adverse = (drift_tot < -KALSHI_DRIFT_THRESHOLD if direction == "ABOVE"
-                   else drift_tot > KALSHI_DRIFT_THRESHOLD)
-        if adverse:
-            log(f"  STRATEGY SKIP — Kalshi drift against {direction}: {drift_str}")
-            _update_prior(fire_results)
             return
-        else:
-            log(f"  📈 Kalshi drift OK: {drift_str}")
-    else:
-        log(f"  ⚠ Kalshi snapshots unavailable — skipping drift rule")
 
-    # ── All rules passed — place the bet ──────────────────────────────────
-    ev_str = f" EV:{ev*100:+.1f}¢" if ev is not None else ""
-    log(f"  ★ STRATEGY BET → {direction} "
-        f"| F7:{conf7*100:.1f}% F8:{conf8*100:.1f}% F9:{conf9*100:.1f}%"
-        f"{ev_str} | R.Vol:{real_vol*100:.1f}%")
+        if self._zone is None:
+            self._zone = new_zone
+            return
 
-    # Use the F9 Kalshi snapshot already captured during the fire loop.
-    # Fall back to a fresh fetch only if unavailable.
-    prices_for_order = kalshi_snapshots.get(9) or fetch_kalshi_prices(ticker)
-    if prices_for_order:
-        # ── Max bet calculation (informational) ───────────────────────────
-        try:
-            current_balance = get_balance()
-            price_frac      = prices_for_order["yes_ask"] if direction == "ABOVE" else prices_for_order["no_ask"]
-            price_cents     = round(price_frac * 100)
-            max_contracts   = int(current_balance / price_frac)
-            max_cost        = max_contracts * price_frac
-            max_payout      = float(max_contracts)
-            max_profit      = max_payout - max_cost
-            log(f"  💡 Max bet: ${max_cost:.2f} → ${max_payout:.2f} payout (+${max_profit:.2f} profit)")
-        except Exception as e:
-            log(f"  ⚠ Could not calculate max bet: {e}")
+        if new_zone != self._zone:
+            self._cross_count += 1
+            self._zone = new_zone
+            self._last_cross_t_remaining = t_remaining
 
-        place_order(
-            ticker    = ticker,
-            direction = direction,
-            yes_ask   = prices_for_order["yes_ask"],
-            no_ask    = prices_for_order["no_ask"],
+    def should_skip(self) -> "tuple[bool, str]":
+        if self._cross_count < CONTESTED_CROSS_MAX_COUNT:
+            return False, ""
+        return True, (
+            f"contested-strike filter: BTC made {self._cross_count} meaningful "
+            f"strike crossings with >=${self._excursion:,.0f} excursions "
+            f"(max above +${self._max_above:,.0f}, max below -${self._max_below:,.0f}"
+            + (f", last cross at T-{self._last_cross_t_remaining:.0f}s" if self._last_cross_t_remaining is not None else "")
+            + ")"
         )
+
+
+# ── Helpers / logging / auth / API ────────────────────────────────────────────
+
+def get_watch_secs() -> int:
+    return WATCH_SECS_WEEKDAY if datetime.datetime.now().weekday() < 5 else WATCH_SECS_WEEKEND
+
+def day_mode() -> str:
+    return "weekday" if datetime.datetime.now().weekday() < 5 else "weekend"
+
+def log(msg: str):
+    ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    safe_line = line.encode("utf-8", errors="replace").decode("utf-8")
+    print(safe_line, flush=True)
+    with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
+        f.write(safe_line + "\n")
+
+def _auth(method: str, path: str) -> dict:
+    key = serialization.load_pem_private_key(KALSHI_PRIVATE_KEY, password=None)
+    ts  = str(int(time.time() * 1000))
+    msg = f"{ts}{method.upper()}{path}".encode()
+    sig = base64.b64encode(
+        key.sign(msg, asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.MAX_LENGTH,
+        ), hashes.SHA256())
+    ).decode()
+    return {"Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig}
+
+def api_get(path: str, params: dict = None, auth: bool = False) -> dict:
+    headers = _auth("GET", path) if auth else {"accept": "application/json"}
+    r = requests.get(f"{BASE_URL}{path}", params=params or {}, headers=headers, timeout=8)
+    r.raise_for_status()
+    return r.json()
+
+def get_balance() -> float:
+    return api_get("/trade-api/v2/portfolio/balance", auth=True).get("balance", 0) / 100
+
+def find_btc_series() -> str:
+    data = api_get("/trade-api/v2/series/", params={"limit": 200})
+    for s in (data.get("series") or []):
+        ticker = (s.get("ticker") or "").lower()
+        if "btc15m" in ticker or "kxbtc15m" in ticker:
+            return s["ticker"]
+    raise ValueError("BTC 15-min series not found")
+
+def _extract_strike(market: dict) -> "float | None":
+    import re as _re
+    fs = market.get("floor_strike")
+    if fs is not None:
+        try:
+            return float(fs)
+        except (TypeError, ValueError):
+            pass
+    m = _re.search(r'\$?([\d,]+\.?\d*)', market.get("yes_sub_title") or "")
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+def get_current_btc_market(series_ticker: str) -> "dict | None":
+    data = api_get("/trade-api/v2/markets/",
+                   params={"series_ticker": series_ticker, "status": "open", "limit": 100})
+    now   = datetime.datetime.now(datetime.timezone.utc)
+    valid = []
+    for m in data.get("markets", []):
+        ct = m.get("close_time")
+        if not ct:
+            continue
+        close_dt  = datetime.datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        secs_left = (close_dt - now).total_seconds()
+        if secs_left >= MARKET_MIN_SECS:
+            valid.append((secs_left, m))
+    if not valid:
+        return None
+    valid.sort(key=lambda x: x[0])
+    return valid[0][1]
+
+def secs_to_close(market: dict) -> float:
+    ct = datetime.datetime.fromisoformat(market["close_time"].replace("Z", "+00:00"))
+    return (ct - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+
+def wait_for_fresh_startup_market(series_ticker: str) -> None:
+    """Ignore the market that is already open at startup.
+
+    This prevents the bot from joining a partially elapsed 15-minute BTC market
+    when the program is launched mid-candle. Normal trading begins only after a
+    different market appears with close to a full 15 minutes remaining.
+    """
+    startup_market = get_current_btc_market(series_ticker)
+
+    if startup_market is None:
+        log("No open BTC market at startup — waiting for first fresh 15-minute market...")
+        startup_ticker = None
     else:
-        log("  ❌ ORDER SKIPPED — could not fetch live prices for order placement")
+        startup_ticker = startup_market.get("ticker")
+        startup_secs = secs_to_close(startup_market)
+        log(f"Startup market detected: {startup_ticker}  closes in {startup_secs:.0f}s")
+        log("Waiting for next fresh 15-minute market before trading...")
 
-    _update_prior(fire_results)
+    while True:
+        time.sleep(STARTUP_POLL_SECS)
+
+        current = get_current_btc_market(series_ticker)
+        if current is None:
+            continue
+
+        current_ticker = current.get("ticker")
+        current_secs = secs_to_close(current)
+
+        if current_ticker == startup_ticker:
+            continue
+
+        if current_secs < STARTUP_FRESH_MIN_SECS:
+            log(f"Saw new market {current_ticker}, but it only has {current_secs:.0f}s left "
+                f"(< {STARTUP_FRESH_MIN_SECS}s). Waiting for a fresher market...")
+            startup_ticker = current_ticker
+            continue
+
+        log(f"Fresh market detected: {current_ticker}  closes in {current_secs:.0f}s — starting trading loop")
+        return
+
+def get_prices(ticker: str) -> "dict | None":
+    try:
+        m  = api_get(f"/trade-api/v2/markets/{ticker}").get("market", {})
+        ya = m.get("yes_ask_dollars")
+        na = m.get("no_ask_dollars")
+        if ya is None and na is None:
+            return None
+        return {"yes_ask": float(ya) if ya is not None else None,
+                "no_ask":  float(na) if na is not None else None,
+                "strike":  _extract_strike(m)}
+    except Exception as e:
+        log(f"  price fetch error: {e}")
+        return None
+
+def get_orderbook_totals(ticker: str) -> "tuple[int | None, int | None]":
+    try:
+        book = api_get(f"/trade-api/v2/markets/{ticker}/orderbook").get("orderbook_fp", {})
+        yes_total = sum(float(qty) for _, qty in book.get("yes_dollars", []))
+        no_total  = sum(float(qty) for _, qty in book.get("no_dollars",  []))
+        return int(yes_total), int(no_total)
+    except Exception as e:
+        log(f"  📖 Order book fetch error: {e}")
+        return None, None
+
+def log_orderbook_depth(ticker: str, side: str):
+    try:
+        book = api_get(f"/trade-api/v2/markets/{ticker}/orderbook").get("orderbook_fp", {})
+        for s, key in (("yes", "yes_dollars"), ("no", "no_dollars")):
+            entries = book.get(key, [])
+            if not entries:
+                log(f"  📖 Order book ({s.upper()}): empty")
+            else:
+                total = sum(float(qty) for _, qty in entries)
+                top   = entries[-5:][::-1]
+                lines = "  ".join(f"{round(float(p)*100)}¢×{round(float(q))}" for p, q in top)
+                log(f"  📖 Order book ({s.upper()}): {round(total)} contracts total — {lines}")
+    except Exception as e:
+        log(f"  📖 Order book fetch error: {e}")
+
+def log_btc_info(tracker: BtcSpotTracker, strike: float, side: str):
+    spot = tracker.latest()
+    mom  = tracker.momentum(lookback_secs=60)
+    if spot is None:
+        log("  📊 BTC spot: unavailable")
+        return
+    dist = (spot - strike) if strike else None
+    dist_str = (f"${dist:+,.0f} from strike ({'favors YES' if dist > 0 else 'favors NO'})"
+                if dist is not None else "strike unknown")
+    if mom is not None:
+        toward  = dist is not None and ((dist > 0 and mom < 0) or (dist < 0 and mom > 0))
+        mom_str = (f"${mom:+.2f}/s {'↑ rising' if mom > 0 else '↓ falling'} → "
+                   f"{'moving TOWARD strike ⚠' if toward else 'moving AWAY from strike ✅'}")
+    else:
+        mom_str = "unavailable"
+    log(f"  📊 BTC ${spot:,.0f}  {dist_str}  momentum {mom_str}")
 
 
-def _update_prior(fire_results: dict):
-    f1 = fire_results.get(1)
-    f9 = fire_results.get(9)
-    if f1 and f9:
-        set_prior_market(f1_spot=f1[3], f6_spot=f9[3], sigma=f9[4])
+# ── Filters ───────────────────────────────────────────────────────────────────
+
+def price_climbed_too_fast(side: str, price_history: deque) -> "tuple[bool, str]":
+    if not price_history:
+        return False, ""
+    cutoff = time.time() - CLIMB_LOOKBACK_SECS
+    oldest = next(((ts, yc, nc) for ts, yc, nc in price_history if ts >= cutoff), None)
+    if oldest is None:
+        return False, ""
+    _, old_yc, old_nc = oldest
+    new_ts, new_yc, new_nc = price_history[-1]
+    if side == "yes" and old_yc is not None and new_yc is not None:
+        climb, elapsed = new_yc - old_yc, new_ts - oldest[0]
+    elif side == "no" and old_nc is not None and new_nc is not None:
+        climb, elapsed = new_nc - old_nc, new_ts - oldest[0]
+    else:
+        return False, ""
+    if climb <= CLIMB_MAX_CENTS:
+        return False, ""
+    return True, f"{side.upper()} climbed {climb}¢ in {elapsed:.0f}s (max {CLIMB_MAX_CENTS}¢/{CLIMB_LOOKBACK_SECS}s)"
+
+def buffer_too_small(side: str, dist: "float | None", mom: "float | None",
+                     secs_remaining: float) -> "tuple[bool, str]":
+    """Uses pre-snapshotted dist and momentum so the same values are used
+    here as everywhere else in the poll loop — no second tracker call."""
+    if dist is None:
+        return False, ""
+    if side == "yes" and dist < BTC_MIN_BUFFER:
+        return True, f"BTC buffer too small for YES (${dist:+,.0f}, need +${BTC_MIN_BUFFER:,.0f})"
+    if side == "no" and dist > -BTC_MIN_BUFFER:
+        return True, f"BTC buffer too small for NO (${dist:+,.0f}, need -${BTC_MIN_BUFFER:,.0f})"
+    if secs_remaining <= BUFFER_SKIP_PROJECTED_SECS:
+        return False, ""
+    if mom is not None:
+        moving_toward = (side == "yes" and mom < 0) or (side == "no" and mom > 0)
+        if moving_toward:
+            erosion   = abs(mom) * secs_remaining
+            projected = abs(dist) - erosion
+            if projected < BTC_MIN_PROJECTED_BUFFER:
+                return True, (f"projected buffer too small for {side.upper()} "
+                              f"(${abs(dist):,.0f} - ${erosion:,.0f} erosion = "
+                              f"${projected:,.0f} projected, need ${BTC_MIN_PROJECTED_BUFFER:,.0f})")
+    return False, ""
+
+def buffer_not_sustained(side: str,
+                         buffer_sufficient_since: "float | None",
+                         buffer_at_window_open: bool) -> "tuple[bool, str]":
+    """Block triggers where the ≥$50 buffer appeared mid-window and has not been
+    continuously held for BUFFER_MIN_SUSTAINED_SECS seconds. If the buffer was
+    already present on the first poll of the watch window, bypass entirely —
+    BTC was already separated before we started watching."""
+    if buffer_at_window_open:
+        return False, ""
+    if buffer_sufficient_since is None:
+        return True, f"buffer has not yet reached ${BTC_MIN_BUFFER:,.0f}"
+    age = time.time() - buffer_sufficient_since
+    if age < BUFFER_MIN_SUSTAINED_SECS:
+        return True, (f"{side.upper()} buffer only sustained for {age:.0f}s "
+                      f"(need {BUFFER_MIN_SUSTAINED_SECS}s continuously)")
+    return False, ""
+
+def marginal_certainty_veto(side: str, price_cents: "int | None",
+                             btc_dist: "float | None",
+                             secs_remaining: float) -> "tuple[bool, str]":
+    if price_cents is None or btc_dist is None:
+        return False, ""
+    if price_cents < MARGINAL_CERTAINTY_MIN_CENTS:
+        return False, ""
+    if secs_remaining <= MARGINAL_CERTAINTY_MIN_SECS:
+        return False, ""
+
+    buffer = abs(btc_dist)
+    if buffer >= MARGINAL_CERTAINTY_BUFFER:
+        return False, ""
+
+    return True, (
+        f"marginal certainty filter: {side.upper()} {price_cents}¢ at "
+        f"T-{secs_remaining:.0f}s with only ${buffer:,.0f} buffer "
+        f"(need ${MARGINAL_CERTAINTY_BUFFER:,.0f} for early 99¢ triggers)"
+    )
+
+def roc_too_high(tracker: BtcSpotTracker, side: str, strike: float) -> "tuple[bool, str]":
+    abs_move, net_move = tracker.change_over_mins(BTC_ROC_LOOKBACK_MINS)
+    if abs_move is None or abs_move <= BTC_MAX_ROC_MOVE:
+        return False, ""
+    moving_toward = (side == "yes" and net_move < 0) or (side == "no" and net_move > 0)
+    if moving_toward:
+        direction = "falling" if net_move < 0 else "rising"
+        return True, (f"BTC moved ${abs_move:,.0f} in {BTC_ROC_LOOKBACK_MINS}min "
+                      f"{direction} toward strike (max ${BTC_MAX_ROC_MOVE:,.0f})")
+    return False, ""
+
+def recent_range_veto(tracker: BtcSpotTracker, side: str,
+                      btc_dist: "float | None",
+                      elapsed_watch_secs: float) -> "tuple[bool, str]":
+    if btc_dist is None:
+        return False, ""
+
+    scan_secs = max(1, int(elapsed_watch_secs))
+    recent_range, low, high = tracker.max_range_window(
+        scan_secs,
+        RECENT_RANGE_WINDOW_SECS,
+    )
+    if recent_range is None or recent_range < RECENT_RANGE_MIN_MOVE:
+        return False, ""
+
+    buffer = abs(btc_dist)
+    required_buffer = RECENT_RANGE_BUFFER_MULT * recent_range
+    if buffer >= required_buffer:
+        return False, ""
+
+    return True, (
+        f"recent volatility filter: BTC max {RECENT_RANGE_WINDOW_SECS // 60}m range "
+        f"${recent_range:,.0f} (${low:,.0f}–${high:,.0f}) found during current "
+        f"watch window ({scan_secs}s elapsed); {side.upper()} buffer ${buffer:,.0f} "
+        f"< {RECENT_RANGE_BUFFER_MULT:.2f}× range = ${required_buffer:,.0f}"
+    )
+
+def shallow_book(side: str, yes_total: "int | None", no_total: "int | None") -> "tuple[bool, str]":
+    if yes_total is None or no_total is None:
+        return False, ""
+    bet_book = yes_total if side == "yes" else no_total
+    opp_book = no_total  if side == "yes" else yes_total
+    if opp_book == 0:
+        return False, ""
+    ratio = bet_book / opp_book
+    if bet_book < SHALLOW_BOOK_MAX_CONTRACTS and ratio > SHALLOW_BOOK_MIN_RATIO:
+        return True, (f"shallow and lopsided {side.upper()} book "
+                      f"({bet_book:,} contracts, {ratio:.0f}x opposing — "
+                      f"need >{SHALLOW_BOOK_MAX_CONTRACTS:,} or <{SHALLOW_BOOK_MIN_RATIO}x ratio)")
+    return False, ""
+
+def post_climb_skip_veto(side: str, btc_dist: "float | None",
+                         btc_at_prior_skip: "float | None",
+                         current_btc: "float | None") -> "tuple[bool, str]":
+    if btc_at_prior_skip is None or side != "no":
+        return False, ""
+    if btc_dist is None or current_btc is None:
+        return False, ""
+
+    retracement_risk = btc_at_prior_skip - current_btc
+
+    if retracement_risk <= 0:
+        return False, ""
+
+    if retracement_risk <= POST_CLIMB_STALL_THRESHOLD:
+        return False, ""
+
+    gap_below = abs(btc_dist)
+    required  = POST_CLIMB_SAFETY_RATIO * retracement_risk
+
+    if gap_below < required:
+        return True, (
+            f"post-climb-skip veto: BTC fell ${retracement_risk:,.0f} since prior skip "
+            f"(from ${btc_at_prior_skip:,.0f}), gap below strike ${gap_below:,.0f} "
+            f"< {POST_CLIMB_SAFETY_RATIO:.0%} of retracement risk ${required:,.0f}"
+        )
+    return False, ""
+
+
+# ── Order placement ───────────────────────────────────────────────────────────
+
+def _best_bid_from_orderbook(entries) -> "tuple[float | None, float | None]":
+    """Return best bid price and qty from a Kalshi orderbook side.
+
+    Kalshi orderbook arrays are bid ladders. The highest bid is normally the
+    last element, but we use max() defensively in case ordering changes.
+    """
+    if not entries:
+        return None, None
+    try:
+        price, qty = max(((float(p), float(q)) for p, q in entries), key=lambda x: x[0])
+        return price, qty
+    except Exception:
+        return None, None
+
+
+def get_live_executable_quote(ticker: str, side: str) -> "tuple[int | None, float | None, float | None, str]":
+    """Get the live executable outcome ask from the bid-only Kalshi orderbook.
+
+    Kalshi orderbook endpoint returns bids only:
+    - YES bids are counterparties willing to buy YES.
+    - NO bids are counterparties willing to buy NO.
+
+    To buy YES immediately, you sell NO / cross the best NO bid:
+        executable YES ask = 1 - best NO bid
+        V2 payload: side="bid", price=YES ask
+
+    To buy NO immediately, you sell YES / cross the best YES bid:
+        executable NO ask = 1 - best YES bid
+        V2 payload: side="ask", price=YES bid
+
+    Returns:
+        outcome_ask_cents, kalshi_price, available_qty, debug_note
+    """
+    try:
+        book = api_get(f"/trade-api/v2/markets/{ticker}/orderbook").get("orderbook_fp", {})
+        yes_bid, yes_qty = _best_bid_from_orderbook(book.get("yes_dollars", []))
+        no_bid, no_qty   = _best_bid_from_orderbook(book.get("no_dollars", []))
+
+        if side == "yes":
+            if no_bid is None:
+                return None, None, None, "no NO bid available to derive executable YES ask"
+            outcome_ask = 1.0 - no_bid
+            kalshi_price = outcome_ask
+            qty = no_qty
+            note = (f"best NO bid {round(no_bid*100)}¢×{round(no_qty or 0)} "
+                    f"=> executable YES ask {round(outcome_ask*100)}¢")
+        elif side == "no":
+            if yes_bid is None:
+                return None, None, None, "no YES bid available to derive executable NO ask"
+            outcome_ask = 1.0 - yes_bid
+            kalshi_price = yes_bid
+            qty = yes_qty
+            note = (f"best YES bid {round(yes_bid*100)}¢×{round(yes_qty or 0)} "
+                    f"=> executable NO ask {round(outcome_ask*100)}¢")
+        else:
+            return None, None, None, f"unknown side {side!r}"
+
+        return round(outcome_ask * 100), kalshi_price, qty, note
+    except Exception as e:
+        return None, None, None, f"orderbook quote error: {e}"
+
+
+def place_order(ticker: str, side: str, ask: float) -> bool:
+    """Place an IOC order using Kalshi V2 /portfolio/events/orders semantics.
+
+    This version does NOT trust the earlier market quote once a trigger fires.
+    It refreshes the bid-only orderbook immediately before each IOC and derives
+    the currently executable outcome ask from the opposite bid ladder.
+
+    IMPORTANT:
+    - V2 order "side" is the YES book side, not the outcome name.
+    - Buying YES: side="bid", price = executable YES ask.
+    - Buying NO:  side="ask", price = best YES bid, because selling YES into
+      the YES bid is economically the same as buying NO at 1 - YES bid.
+    """
+    try:
+        balance = get_balance()
+        log(f"  Balance: ${balance:,.2f}")
+    except Exception as e:
+        log(f"  Could not verify balance: {e} — skipping order")
+        return False
+
+    trigger_min_cents = BUY_MIN_CENTS
+    trigger_max_cents = BUY_MAX_CENTS - 1
+    path = "/trade-api/v2/portfolio/events/orders"
+
+    # Once a trigger has passed all filters, buy the live executable quote even
+    # if the refreshed price is outside the original trigger band. The 98¢–99¢
+    # band is only the signal that starts execution; it is not a post-trigger
+    # limit price. A few rapid quote-refresh attempts help with races where the
+    # counterpart bid flickers.
+    for attempt_num in range(1, 6):
+        live_cents, kalshi_price, available_qty, quote_note = get_live_executable_quote(ticker, side)
+        log(f"  🔎 Live executable quote attempt {attempt_num}: {quote_note}")
+
+        if live_cents is None or kalshi_price is None:
+            time.sleep(0.05)
+            continue
+
+        if live_cents < trigger_min_cents:
+            log(f"  ✅ Live {side.upper()} ask improved to {live_cents}¢ "
+                f"below trigger band {trigger_min_cents}¢–{trigger_max_cents}¢ — buying")
+        elif live_cents > trigger_max_cents:
+            log(f"  ⚠ Live {side.upper()} ask worsened to {live_cents}¢ "
+                f"above trigger band {trigger_min_cents}¢–{trigger_max_cents}¢ — buying anyway")
+
+        contracts = (BET_DOLLARS * 100) // live_cents
+        if contracts < 1:
+            log(f"  SKIP — not enough funds for 1 contract at {live_cents}¢")
+            return False
+
+        # Do not request more contracts than visible executable qty if the top
+        # level is thinner than the intended size.
+        if available_qty is not None and available_qty > 0:
+            contracts = min(int(contracts), int(available_qty))
+            if contracts < 1:
+                log("  MISS — executable top-level quantity disappeared")
+                time.sleep(0.05)
+                continue
+
+        outcome_price  = live_cents / 100.0
+        fee            = math.ceil(0.07 * contracts * outcome_price * (1 - outcome_price) * 100) / 100
+        attempt_cost   = round(contracts * outcome_price, 2)
+        attempt_profit = round(float(contracts) - attempt_cost, 2)
+
+        if side == "yes":
+            book_side = "bid"
+            conversion_note = f"YES buy {live_cents}¢ => YES bid {round(kalshi_price * 100)}¢"
+        elif side == "no":
+            book_side = "ask"
+            conversion_note = f"NO buy {live_cents}¢ => YES ask/bid-cross {round(kalshi_price * 100)}¢"
+        else:
+            log(f"  ❌ ORDER FAILED — unknown side {side!r}")
+            return False
+
+        payload = {
+            "ticker":                     ticker,
+            "client_order_id":            str(uuid.uuid4()),
+            "side":                       book_side,
+            "count":                      f"{int(contracts)}.00",
+            "price":                      f"{kalshi_price:.4f}",
+            "time_in_force":              "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+        }
+
+        log(f"  🧾 Submit IOC — {conversion_note}; payload side={book_side} "
+            f"price={kalshi_price:.4f} count={contracts}")
+
+        try:
+            r = requests.post(f"{BASE_URL}{path}", headers=_auth("POST", path),
+                              json=payload, timeout=8)
+            log(f"  🧾 Order HTTP {r.status_code}: {r.text[:500]}")
+
+            if r.status_code == 201:
+                order      = r.json()
+                fill_count = order.get("fill_count", "0")
+                remaining  = order.get("remaining_count", "0")
+                order_id   = order.get("order_id", "?")
+                got_fill   = float(fill_count) > 0
+                status     = "filled" if got_fill else "unfilled"
+                log(f"  {'✅ ORDER PLACED' if got_fill else '⚠ NO FILL'} — "
+                    f"{side.upper()} x{contracts} @ {live_cents}¢  "
+                    f"cost=${attempt_cost:.2f}  fee=${fee:.2f}  "
+                    f"net profit if win=${attempt_profit - fee:.2f}  "
+                    f"order_id={order_id}  filled={fill_count}  remaining={remaining}  status={status}")
+                if got_fill:
+                    return True
+                time.sleep(0.05)
+                continue
+
+            if r.status_code == 400 and "invalid_price" in r.text:
+                log("  ⚡ MISSED — price invalid or market moved before order filled")
+                return False
+
+            log(f"  ❌ ORDER FAILED — HTTP {r.status_code}: {r.text[:300]}")
+            time.sleep(0.05)
+            continue
+        except Exception as e:
+            log(f"  ❌ ORDER EXCEPTION — {e}")
+            time.sleep(0.05)
+            continue
+
+    log(f"  ❌ NO FILL after 5 live quote attempts — giving up on this market")
+    return False
+
+def _check_loss_after_settlement(ticker: str, side: str):
+    log(f"  Waiting for settlement on {ticker}…")
+    for _ in range(60):
+        time.sleep(15)
+        try:
+            data = api_get("/trade-api/v2/portfolio/settlements",
+                           params={"limit": 50}, auth=True)
+            for s in data.get("settlements", []):
+                if s.get("ticker") == ticker:
+                    result = s.get("market_result", "?")
+                    if result == side:
+                        log(f"  ✅ WIN — result={result}")
+                    else:
+                        log(f"  🛑 LOSS DETECTED — result={result} but bet was {side}. Shutting down.")
+                        sys.exit(1)
+                    return
+        except Exception as e:
+            log(f"  settlement check error: {e}")
+    log(f"  ⚠ Settlement timeout for {ticker} — continuing")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    print(Fore.CYAN + Style.BRIGHT + "\n  ₿  BTC Kalshi Auto-Predictor")
-    print(Fore.WHITE + "  Running 24/7 — 9 predictions per 15-min market")
-    print(Fore.WHITE + f"  Fire times: {FIRE_OFFSETS_SECS} seconds after boundary")
-    print(Fore.WHITE + f"  Decision fires: F7/F8/F9 (~9min, ~7.5min, ~5min remaining)")
-    print(Fore.YELLOW + "  Strategy rules active:")
-    print(Fore.YELLOW + f"    1. Window:      9:45am–6:45pm EST, 7 days a week")
-    print(Fore.YELLOW + f"    2. Vol floor:   R.Vol ≥ {VOL_FLOOR*100:.0f}%")
-    print(Fore.YELLOW + f"    3. Vol ceiling: Volume ≤ {VOL_PCT_MAX*100:.0f}% of avg (extreme spike filter)")
-    print(Fore.YELLOW + f"    4. Vol accel:   {VOL_ACCEL_SHORT_MINS}m vol ≤ {VOL_ACCEL_THRESHOLD:.1f}x "
-                        f"{VOL_ACCEL_LONG_MINS}m vol (regime shift — fires at prefetch)")
-    print(Fore.YELLOW + f"    5. Agreement:   F7/F8/F9 same direction")
-    print(Fore.YELLOW + f"    6. Confidence:  F7 ≥ {CONF_MIN_F7*100:.0f}% AND F8 ≥ {CONF_MIN_F8*100:.0f}% AND F9 ≥ {CONF_MIN_F9*100:.0f}%")
-    print(Fore.YELLOW + f"    7. Autocorr:    autocorr ≥ {AUTOCORR_MIN:+.2f} (regime filter)")
-    print(Fore.YELLOW + f"    8. EV:          logged only (no filter) — fixed payout makes edge size irrelevant")
-    print(Fore.YELLOW + f"    9. Prior move:  if prev mkt > {PRIOR_SIGMA_HARD_BLOCK:.0f}σ → hard skip | "
-                        f"> {PRIOR_SIGMA_THRESH:.0f}σ → F9 ≥ {CONF_MIN_F9_BOOSTED*100:.0f}%")
-    print(Fore.YELLOW + f"   10. Decel:       late velocity ≥ {DECEL_THRESHOLD*100:.0f}% of early velocity "
-                        f"(min early momentum: {DECEL_MIN_VELOCITY:.0f}$/min)")
-    print(Fore.YELLOW + f"   11. Rev. guard:  F8→F9 pullback ≤ {REVERSAL_GUARD_SIGMA:.2f}σ")
-    print(Fore.YELLOW + f"   12. Kalshi drift: F7→F8→F9 YES ask, skip if total > {KALSHI_DRIFT_THRESHOLD*100:.0f}¢ adverse or accelerating")
-    print(Fore.CYAN  + f"  Betting: ${BET_AMOUNT_DOLLARS:.2f} per bet | halt at ${BALANCE_FLOOR:.0f} balance floor")
-    print(Fore.WHITE + f"  Logging to: {LOG_FILE}")
-    print(Fore.WHITE + "  Press Ctrl+C to stop\n")
-
     log("=" * 60)
-    log("BTC Kalshi Auto-Predictor started — 9 fires per market, live betting ON")
+    log("Last-Second Buyer — BTC 15-min  LIVE TRADING")
+    log(f"Buy: {BUY_MIN_CENTS}¢–{BUY_MAX_CENTS-1}¢  |  "
+        f"Price-triggered  |  Bet: ${BET_DOLLARS}  |  "
+        f"Watch: {WATCH_SECS_WEEKDAY}s weekdays / {WATCH_SECS_WEEKEND}s weekends  |  "
+        f"Entry starts: T-{ENTRY_START_SECS}s  |  "
+        f"Max opposing: {MAX_OPPOSING_CENTS}¢  |  "
+        f"Climb filter: {CLIMB_MAX_CENTS}¢/{CLIMB_LOOKBACK_SECS}s  |  "
+        f"Buffer: ${BTC_MIN_BUFFER:,.0f} (reset threshold ${BTC_RESET_BUFFER:,.0f})  |  "
+        f"Sustained buffer: {BUFFER_MIN_SUSTAINED_SECS}s mid-window (bypassed if buffer present at window open)  |  "
+        f"Marginal certainty: {MARGINAL_CERTAINTY_MIN_CENTS}¢ needs "
+        f"${MARGINAL_CERTAINTY_BUFFER:,.0f} buffer at T>{MARGINAL_CERTAINTY_MIN_SECS}s  |  "
+        f"Projected buffer: ${BTC_MIN_PROJECTED_BUFFER:,.0f} (skipped at T<{BUFFER_SKIP_PROJECTED_SECS}s)  |  "
+        f"ROC filter: ${BTC_MAX_ROC_MOVE:,.0f}/{BTC_ROC_LOOKBACK_MINS}min (directional)  |  "
+        f"Recent range filter: ${RECENT_RANGE_MIN_MOVE:,.0f}/{RECENT_RANGE_WINDOW_SECS//60}min "
+        f"inside elapsed watch window needs {RECENT_RANGE_BUFFER_MULT:.2f}x buffer  |  "
+        f"Bounce filter: >${BOUNCE_MIN_EXCURSION:,.0f} cross w/ T>{BOUNCE_MIN_T_REMAINING}s  |  "
+        f"Contested-strike: {CONTESTED_CROSS_MAX_COUNT}+ crosses with >=${CONTESTED_CROSS_EXCURSION:,.0f} excursion  |  "
+        f"Shallow book: <{SHALLOW_BOOK_MAX_CONTRACTS:,} contracts AND >{SHALLOW_BOOK_MIN_RATIO}x ratio  |  "
+        f"Post-climb veto: stall<${POST_CLIMB_STALL_THRESHOLD:,.0f} OR gap>{POST_CLIMB_SAFETY_RATIO:.0%}x retracement risk")
     log("=" * 60)
 
-    # ── Verify credentials and log opening balance ─────────────────────────
+    tracker = BtcSpotTracker()
+    tracker.start()
+    time.sleep(4)
+
+    spot = tracker.latest()
+    if spot is not None and spot < 10_000:
+        log(f"ABORT — spot price ${spot:.2f} looks like ETH, not BTC. Check brti_btc module.")
+        sys.exit(1)
+    if spot is not None:
+        log(f"BTC spot confirmed: ${spot:,.0f}")
+
     try:
-        opening_balance = get_balance()
-        log(f"Account balance at startup: ${opening_balance:,.2f}")
-        if opening_balance <= BALANCE_FLOOR:
-            log(f"STARTUP ABORT — balance ${opening_balance:,.2f} already at or below "
-                f"${BALANCE_FLOOR:.2f} floor. Add funds before running.")
-            sys.exit(1)
+        bal = get_balance()
+        log(f"Opening balance: ${bal:,.2f}")
     except Exception as e:
-        log(f"STARTUP ABORT — could not fetch balance: {e}")
+        log(f"ABORT — could not fetch balance: {e}")
         sys.exit(1)
 
-    series_ticker = None
+    try:
+        series_ticker = find_btc_series()
+        log(f"BTC series: {series_ticker}")
+    except Exception as e:
+        log(f"ABORT — {e}")
+        sys.exit(1)
 
-    while True:
-        try:
-            if series_ticker is None:
-                try:
-                    series_ticker = find_series_ticker()
-                    log(f"Series ticker: {series_ticker}")
-                except Exception as e:
-                    log(f"ERROR finding ticker: {e} — retrying in 60s")
-                    time.sleep(60)
-                    continue
+    wait_for_fresh_startup_market(series_ticker)
 
-            boundary    = next_boundary_utc()
-            prefetch_at = boundary - datetime.timedelta(seconds=PREFETCH_SECS)
-            now_utc     = datetime.datetime.now(datetime.timezone.utc)
-            wait_secs   = (prefetch_at - now_utc).total_seconds()
+    fired_tickers = set()
+    bounce        = BounceTrackerV2()
+    contested     = ContestedStrikeTracker()
 
-            if wait_secs > 0:
-                log(f"Next market in {(boundary - now_utc).total_seconds()/60:.1f}min — "
-                    f"pre-fetching in {wait_secs:.0f}s")
-                time.sleep(wait_secs)
+    # ── Post-climb-skip veto state ─────────────────────────────────────────────
+    btc_at_prior_skip: "float | None" = None
 
-            log("Pre-fetching vol + BRTI...")
-            prefetched = prefetch_all()
-            dvol_str   = ("n/a" if not prefetched.get("impl_vol")
-                          else f"{prefetched['impl_vol']*100:.1f}%")
-            spot_str   = (f"${prefetched['spot']:,.2f}" if prefetched.get('spot')
-                          else "n/a (BRTI failed)")
-            m          = prefetched.get("model")
-            model_str  = (f"GARCH(α={m.garch_alpha:.2f},β={m.garch_beta:.2f}) "
-                          f"t-df={m.t_df:.1f} λ={m.jump_lambda:.4f}") if m else "fallback GBM"
-            ac         = prefetched.get("autocorr")
-            ac_str     = f"autocorr={ac:+.2f}" if ac is not None else "autocorr=n/a"
-            va         = prefetched.get("vol_accel")
-            va_str     = (f"vaccel={va[2]:.2f}x" if va is not None else "vaccel=n/a")
-            log(f"Pre-fetch complete: spot={spot_str}  "
-                f"vol={prefetched.get('real_vol', 0)*100:.1f}%  "
-                f"dvol={dvol_str}  [{model_str}  {ac_str}  {va_str}]")
+    try:
+        while True:
+            market = get_current_btc_market(series_ticker)
 
-            if prefetched.get('spot') is None:
-                log("WARNING: BRTI spot unavailable — skipping this market")
-                sleep_until(boundary + datetime.timedelta(seconds=FIRE_OFFSETS_SECS[-1] + 10))
+            if market is None:
+                log("No open BTC market — retrying in 30s")
+                time.sleep(2)
                 continue
 
-            sleep_until(boundary)
-            log("─" * 60)
-            run_market_cycle(series_ticker, prefetched, boundary)
+            ticker    = market["ticker"]
+            secs_left = secs_to_close(market)
+            strike    = _extract_strike(market)
 
-        except KeyboardInterrupt:
-            log("Stopped by user.")
-            sys.exit(0)
-        except SystemExit:
-            raise  # allow sys.exit(1) from balance floor to propagate
-        except Exception as e:
-            log(f"Unexpected error: {e} — retrying in 30s")
-            time.sleep(30)
+            if strike is None:
+                try:
+                    full = api_get(f"/trade-api/v2/markets/{ticker}").get("market", {})
+                    strike = _extract_strike(full)
+                    if strike:
+                        log(f"  🎯 Strike resolved via individual market fetch: ${strike:,.0f}")
+                    else:
+                        log(f"  ⚠ Strike still unknown. floor_strike={full.get('floor_strike')!r}  "
+                            f"yes_sub_title={full.get('yes_sub_title')!r}")
+                except Exception as e:
+                    log(f"  ⚠ Could not resolve strike: {e}")
+
+            if ticker in fired_tickers:
+                wait = max(secs_left - 5, 5)
+                log(f"Already fired {ticker} — sleeping {wait:.0f}s for next market")
+                time.sleep(wait)
+                continue
+
+            strike_str = f"${strike:,.0f}" if strike else "?"
+            log(f"Market: {ticker}  strike={strike_str}  closes in {secs_left:.0f}s")
+
+            watch_secs = get_watch_secs()
+            wait       = secs_left - watch_secs
+            if wait > 0:
+                log(f"Sleeping {wait:.0f}s until watch window [{day_mode()}]")
+                time.sleep(wait)
+
+            log(f"Watching — trigger: {BUY_MIN_CENTS}¢–{BUY_MAX_CENTS-1}¢ on YES or NO; entries allowed at T-{ENTRY_START_SECS}s")
+            bounce.reset(strike=strike)
+            contested.reset(strike=strike)
+            price_history             = deque(maxlen=200)
+            buffer_sufficient_since: "float | None" = None  # tracks sustained buffer age
+            buffer_at_window_open     = False                # True if buffer was ≥$50 on first poll
+            first_poll                = True                 # used to detect window-open state
+            watch_started_at          = time.time()          # when we entered the watch window
+            last_logged               = None
+
+            while True:
+                secs_left = secs_to_close(market)
+
+                if secs_left < 0:
+                    log("  Market closed without trigger — moving on")
+                    fired_tickers.add(ticker)
+                    break
+
+                prices = get_prices(ticker)
+                if prices:
+                    ya       = prices["yes_ask"]
+                    na       = prices["no_ask"]
+                    ya_cents = round(ya * 100) if ya else None
+                    na_cents = round(na * 100) if na else None
+
+                    if strike is None and prices.get("strike") is not None:
+                        strike = prices["strike"]
+                        log(f"  🎯 Strike resolved from market API: ${strike:,.0f}")
+                        bounce.reset(strike=strike)
+                        contested.reset(strike=strike)
+
+                    price_history.append((time.time(), ya_cents, na_cents))
+
+                    btc_spot = tracker.latest()
+                    if strike is not None and btc_spot is not None:
+                        bounce.update(btc_spot, secs_left)
+                        contested.update(btc_spot, secs_left)
+                        contested_skip, contested_reason = contested.should_skip()
+                        if contested_skip:
+                            log(f"  ⚠ SKIP — {contested_reason}")
+                            fired_tickers.add(ticker)
+                            break
+
+                    # ── Update sustained buffer tracker ────────────────────────
+                    # current_btc_dist and current_btc_mom are snapshotted once here
+                    # and reused everywhere below — avoids calling tracker methods
+                    # multiple times and getting different values from the background thread.
+                    # Start timer when buffer hits BTC_MIN_BUFFER ($50).
+                    # Reset timer only when buffer drops below BTC_RESET_BUFFER ($45)
+                    # to prevent minor jitter from resetting the streak.
+                    current_btc_dist = tracker.distance_from_strike(strike)
+                    current_btc_mom  = tracker.momentum(lookback_secs=60)
+                    if strike is not None and current_btc_dist is not None:
+                        if abs(current_btc_dist) >= BTC_MIN_BUFFER:
+                            if first_poll:
+                                buffer_at_window_open = True
+                            if buffer_sufficient_since is None:
+                                buffer_sufficient_since = time.time()
+                        elif abs(current_btc_dist) < BTC_RESET_BUFFER:
+                            buffer_sufficient_since = None  # genuine dip — reset streak
+                        # between BTC_RESET_BUFFER and BTC_MIN_BUFFER: hold streak, don't reset
+                    if first_poll:
+                        first_poll = False
+
+                    display = f"YES={ya_cents}¢  NO={na_cents}¢"
+                    if display != last_logged:
+                        log(f"  👁 T-{secs_left:.0f}s — {display}")
+                        last_logged   = display
+                        dominant_side = "yes" if (ya_cents or 0) > (na_cents or 0) else "no"
+                        log_btc_info(tracker, strike, dominant_side)
+
+                    if ya_cents == 100 and (na_cents is None or na_cents < BUY_MIN_CENTS):
+                        log("  ⚠ SKIP — YES already at 100¢, no tradeable entry — moving on")
+                        fired_tickers.add(ticker)
+                        break
+
+                    if na_cents == 100 and (ya_cents is None or ya_cents < BUY_MIN_CENTS):
+                        log("  ⚠ SKIP — NO already at 100¢, no tradeable entry — moving on")
+                        fired_tickers.add(ticker)
+                        break
+
+                    # ── Entry gate ────────────────────────────────────────────
+                    # We begin watching at T-540s to build price/volatility context,
+                    # but we do not place trades until T-300s or later.
+                    if secs_left > ENTRY_START_SECS:
+                        time.sleep(POLL_MS)
+                        continue
+
+                    # ── YES trigger ───────────────────────────────────────────
+                    if ya_cents and BUY_MIN_CENTS <= ya_cents < BUY_MAX_CENTS:
+                        if strike is None:
+                            log("  ⚠ SKIP — strike unknown, BTC filters blind")
+                            fired_tickers.add(ticker); break
+                        if current_btc_dist is None:
+                            log("  ⚠ SKIP — BTC spot unavailable, cannot validate buffer")
+                            fired_tickers.add(ticker); break
+                        if na_cents and na_cents > MAX_OPPOSING_CENTS:
+                            log(f"  ⚠ SKIP — opposing NO too high ({na_cents}¢ > {MAX_OPPOSING_CENTS}¢)")
+                            fired_tickers.add(ticker); break
+
+                        climbed, reason = price_climbed_too_fast("yes", price_history)
+                        if climbed:
+                            if secs_left <= CLIMB_BYPASS_SECS:
+                                log(f"  ✅ Climb filter bypassed — only {secs_left:.0f}s left")
+                            else:
+                                log(f"  ⚠ SKIP — climb filter: {reason}")
+                                fired_tickers.add(ticker)
+                                break
+
+                        too_close, reason = buffer_too_small("yes", current_btc_dist, current_btc_mom, secs_left)
+                        if too_close:
+                            log(f"  ⚠ SKIP — buffer filter: {reason}")
+                            fired_tickers.add(ticker); break
+
+                        not_sustained, reason = buffer_not_sustained("yes", buffer_sufficient_since, buffer_at_window_open)
+                        if not_sustained:
+                            log(f"  ⚠ SKIP — sustained buffer filter: {reason}")
+                            fired_tickers.add(ticker); break
+
+                        marginal, reason = marginal_certainty_veto("yes", ya_cents, current_btc_dist, secs_left)
+                        if marginal:
+                            log(f"  ⚠ SKIP — {reason}")
+                            fired_tickers.add(ticker); break
+
+                        too_fast, reason = roc_too_high(tracker, "yes", strike)
+                        if too_fast:
+                            log(f"  ⚠ SKIP — ROC filter: {reason}")
+                            fired_tickers.add(ticker); break
+
+                        range_vetoed, reason = recent_range_veto(tracker, "yes", current_btc_dist, time.time() - watch_started_at)
+                        if range_vetoed:
+                            log(f"  ⚠ SKIP — {reason}")
+                            fired_tickers.add(ticker); break
+
+                        bounced, reason = bounce.should_skip("yes")
+                        if bounced:
+                            log(f"  ⚠ SKIP — bounce filter: {reason}")
+                            fired_tickers.add(ticker); break
+
+                        yes_total, no_total = get_orderbook_totals(ticker)
+                        is_shallow, reason = shallow_book("yes", yes_total, no_total)
+                        if is_shallow:
+                            log(f"  ⚠ SKIP — shallow book filter: {reason}")
+                            fired_tickers.add(ticker); break
+
+                        if btc_at_prior_skip is not None:
+                            log("  ℹ️  Post-climb-skip veto still armed — carries to next market")
+
+                        buffer_age = time.time() - buffer_sufficient_since if buffer_sufficient_since else 0
+                        log(f"  ⏱ Buffer sustained for {buffer_age:.0f}s before trigger")
+                        log_btc_info(tracker, strike, "yes")
+                        log(f"  ⚡ TRIGGER YES — {ya_cents}¢ at T-{secs_left:.0f}s  opposing={na_cents}¢")
+                        log_orderbook_depth(ticker, "yes")
+                        filled = place_order(ticker, "yes", ya)
+                        fired_tickers.add(ticker)
+                        if filled:
+                            _check_loss_after_settlement(ticker, "yes")
+                        else:
+                            log("  No fill — moving on without settlement check")
+                        break
+
+                    # ── NO trigger ────────────────────────────────────────────
+                    if na_cents and BUY_MIN_CENTS <= na_cents < BUY_MAX_CENTS:
+                        if strike is None:
+                            log("  ⚠ SKIP — strike unknown, BTC filters blind")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+                        if current_btc_dist is None:
+                            log("  ⚠ SKIP — BTC spot unavailable, cannot validate buffer")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+                        if ya_cents and ya_cents > MAX_OPPOSING_CENTS:
+                            log(f"  ⚠ SKIP — opposing YES too high ({ya_cents}¢ > {MAX_OPPOSING_CENTS}¢)")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        climbed, reason = price_climbed_too_fast("no", price_history)
+                        if climbed:
+                            if secs_left <= CLIMB_BYPASS_SECS:
+                                log(f"  ✅ Climb filter bypassed — only {secs_left:.0f}s left")
+                            else:
+                                log(f"  ⚠ SKIP — climb filter: {reason}")
+                                fired_tickers.add(ticker)
+                                btc_at_prior_skip = tracker.latest()
+                                log(f"  🚩 Post-climb-skip veto armed — BTC recorded at ${btc_at_prior_skip:,.0f}")
+                                break
+
+                        too_close, reason = buffer_too_small("no", current_btc_dist, current_btc_mom, secs_left)
+                        if too_close:
+                            log(f"  ⚠ SKIP — buffer filter: {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        not_sustained, reason = buffer_not_sustained("no", buffer_sufficient_since, buffer_at_window_open)
+                        if not_sustained:
+                            log(f"  ⚠ SKIP — sustained buffer filter: {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        marginal, reason = marginal_certainty_veto("no", na_cents, current_btc_dist, secs_left)
+                        if marginal:
+                            log(f"  ⚠ SKIP — {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        too_fast, reason = roc_too_high(tracker, "no", strike)
+                        if too_fast:
+                            log(f"  ⚠ SKIP — ROC filter: {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        range_vetoed, reason = recent_range_veto(tracker, "no", current_btc_dist, time.time() - watch_started_at)
+                        if range_vetoed:
+                            log(f"  ⚠ SKIP — {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        bounced, reason = bounce.should_skip("no")
+                        if bounced:
+                            log(f"  ⚠ SKIP — bounce filter: {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        yes_total_ob, no_total_ob = get_orderbook_totals(ticker)
+                        is_shallow, reason = shallow_book("no", yes_total_ob, no_total_ob)
+                        if is_shallow:
+                            log(f"  ⚠ SKIP — shallow book filter: {reason}")
+                            fired_tickers.add(ticker); btc_at_prior_skip = None; break
+
+                        current_btc = tracker.latest()
+                        vetoed, reason = post_climb_skip_veto(
+                            "no", current_btc_dist, btc_at_prior_skip, current_btc
+                        )
+                        if vetoed:
+                            log(f"  ⚠ SKIP — {reason}")
+                            fired_tickers.add(ticker)
+                            btc_at_prior_skip = None
+                            break
+
+                        btc_at_prior_skip = None
+
+                        buffer_age = time.time() - buffer_sufficient_since if buffer_sufficient_since else 0
+                        log(f"  ⏱ Buffer sustained for {buffer_age:.0f}s before trigger")
+                        log_btc_info(tracker, strike, "no")
+                        log(f"  ⚡ TRIGGER NO — {na_cents}¢ at T-{secs_left:.0f}s  opposing={ya_cents}¢")
+                        log_orderbook_depth(ticker, "no")
+                        filled = place_order(ticker, "no", na)
+                        fired_tickers.add(ticker)
+                        if filled:
+                            _check_loss_after_settlement(ticker, "no")
+                        else:
+                            log("  No fill — moving on without settlement check")
+                        break
+
+                time.sleep(POLL_MS)
+
+    except KeyboardInterrupt:
+        log("Stopped by user.")
+    finally:
+        tracker.stop()
 
 
 if __name__ == "__main__":
